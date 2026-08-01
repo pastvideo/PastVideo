@@ -8,8 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use pastvideo::catalog::{
-    apply_categories, load_categories, make_thumbnail, save_categories, scan_folder,
-    semantic_categories,
+    apply_categories, load_categories, make_thumbnail, make_thumbnail_at, save_categories,
+    scan_folder, semantic_categories,
 };
 use pastvideo::{default_embedder, Config, Database, SharedEmbedder};
 
@@ -32,6 +32,60 @@ fn make_video(path: &Path, color: &str) {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+fn make_two_scene_video(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let status = Command::new(ffmpeg_path())
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=160x90:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=160x90:d=1",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0,format=yuv420p[v]",
+            "-map",
+            "[v]",
+            "-g",
+            "25",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn average_channel(thumbnail: &pastvideo::catalog::Thumbnail, channel: usize) -> f64 {
+    thumbnail
+        .rgb
+        .chunks_exact(3)
+        .map(|pixel| pixel[channel] as f64)
+        .sum::<f64>()
+        / (thumbnail.rgb.len() / 3) as f64
+}
+
+#[test]
+fn matched_clip_thumbnail_uses_requested_timestamp() {
+    if !ffmpeg_available() {
+        eprintln!("skipping desktop E2E: ffmpeg unavailable");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let video = temp.path().join("two-scenes.mp4");
+    make_two_scene_video(&video);
+
+    let red = make_thumbnail_at(&video, 0.25, 64, 36).expect("red scene thumbnail");
+    let blue = make_thumbnail_at(&video, 1.25, 64, 36).expect("blue scene thumbnail");
+
+    assert!(average_channel(&red, 0) > average_channel(&red, 2) * 2.0);
+    assert!(average_channel(&blue, 2) > average_channel(&blue, 0) * 2.0);
 }
 
 #[test]

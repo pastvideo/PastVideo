@@ -440,6 +440,37 @@ pub fn extract_frames(path: &Path, n: usize, width: usize, height: usize) -> Res
     Ok(frames)
 }
 
+/// Extract one frame at an exact video timestamp. This is used for semantic
+/// match previews, where a generic file thumbnail would hide the moment that
+/// actually matched the query.
+pub fn extract_frame_at(path: &Path, timestamp: f64, width: usize, height: usize) -> Result<Frame> {
+    let ffmpeg = find_ffmpeg()?;
+    let frame_bytes = width * height * 3;
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-ss"])
+        .arg(timestamp.max(0.0).to_string())
+        .arg("-i")
+        .arg(path)
+        .args(["-frames:v", "1", "-vf"])
+        .arg(format!("scale={width}:{height}"))
+        .args(["-pix_fmt", "rgb24", "-f", "rawvideo"])
+        .arg("pipe:1")
+        .output()
+        .map_err(|error| Error::Ffmpeg(format!("frame seek failed: {error}")))?;
+    if !output.status.success() || output.stdout.len() < frame_bytes {
+        return Err(Error::Ffmpeg(format!(
+            "could not decode {} at {timestamp:.2}s: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(Frame {
+        width,
+        height,
+        rgb: output.stdout[..frame_bytes].to_vec(),
+    })
+}
+
 /// Extract a single frame from an image file as raw RGB24.
 pub fn extract_image_frame(path: &Path, width: usize, height: usize) -> Result<Frame> {
     let ffmpeg = find_ffmpeg()?;

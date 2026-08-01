@@ -7,7 +7,7 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
-use crate::chunker::{extract_frames, scan_directory, video_duration};
+use crate::chunker::{extract_frame_at, extract_frames, scan_directory, video_duration};
 use crate::{Database, Result};
 
 pub const CATEGORY_DEFINITIONS: [(&str, &str); 9] = [
@@ -132,6 +132,20 @@ pub fn scan_folders(folders: &[PathBuf]) -> Vec<VideoInfo> {
 
 pub fn make_thumbnail(path: &Path, width: usize, height: usize) -> Option<Thumbnail> {
     let frame = extract_frames(path, 1, width, height).ok()?.pop()?;
+    Some(Thumbnail {
+        width: frame.width,
+        height: frame.height,
+        rgb: frame.rgb,
+    })
+}
+
+pub fn make_thumbnail_at(
+    path: &Path,
+    timestamp: f64,
+    width: usize,
+    height: usize,
+) -> Option<Thumbnail> {
+    let frame = extract_frame_at(path, timestamp, width, height).ok()?;
     Some(Thumbnail {
         width: frame.width,
         height: frame.height,
