@@ -57,7 +57,7 @@ impl QwenConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(automatic_batch_size)
-            .clamp(1, 8);
+            .clamp(1, 12);
 
         for (label, path) in [
             ("Qwen Python runtime", &python),

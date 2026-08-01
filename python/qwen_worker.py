@@ -15,11 +15,13 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import traceback
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +34,49 @@ RETRIEVAL_INSTRUCTION = "Retrieve video clips relevant to the user's query."
 _ALIAS_DIR = tempfile.TemporaryDirectory(prefix="pastvideo-qwen-")
 _ALIAS_CACHE: dict[str, str] = {}
 _VIDEO_READER_CACHE: OrderedDict[str, VideoReader] = OrderedDict()
+_VIDEO_METADATA_CACHE: dict[str, tuple[int, int, str]] = {}
 _MAX_CACHED_VIDEO_READERS = 2
+_VIDEO_PATCH_FACTOR = 64
+_VIDEO_MIN_PIXELS = 128 * 32 * 32
+_VIDEO_MAX_PIXELS = 768 * 32 * 32
+_RESIZE_WORKERS = max(
+    1,
+    min(
+        8,
+        int(os.environ.get("PASTVIDEO_QWEN_RESIZE_THREADS", os.cpu_count() or 4)),
+    ),
+)
+_DECODE_WORKERS = max(
+    1,
+    min(2, int(os.environ.get("PASTVIDEO_QWEN_DECODE_WORKERS", "2"))),
+)
+_HW_DECODE_SETTING = os.environ.get(
+    "PASTVIDEO_QWEN_HW_DECODE", "auto"
+).strip().lower()
+_HW_DECODE_MIN_PIXELS = int(
+    os.environ.get("PASTVIDEO_QWEN_HW_DECODE_MIN_PIXELS", "3000000")
+)
+_CUDA_DECODE_ENABLED = False
+_SUBPROCESS_FLAGS = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+)
+
+
+def find_ffmpeg() -> Path | None:
+    executable = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    candidates = [
+        os.environ.get("PASTVIDEO_FFMPEG"),
+        Path(__file__).resolve().parent.parent / ".tools" / "ffmpeg" / "bin" / executable,
+        shutil.which(executable),
+        shutil.which("ffmpeg"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return Path(candidate).resolve()
+    return None
+
+
+_FFMPEG = find_ffmpeg()
 
 
 def close_video_readers() -> None:
@@ -76,6 +120,171 @@ def decoder_path(path: str) -> str:
     return str(alias)
 
 
+def run_subprocess(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+    if os.name == "nt":
+        kwargs["creationflags"] = _SUBPROCESS_FLAGS
+    return subprocess.run(command, **kwargs)
+
+
+def video_metadata(path: str) -> tuple[int, int, str]:
+    """Read the primary video shape/codec without decoding full frames."""
+
+    cached = _VIDEO_METADATA_CACHE.get(path)
+    if cached is not None:
+        return cached
+    if _FFMPEG is None:
+        raise FileNotFoundError("ffmpeg was not found for hardware decoding")
+    ffprobe = _FFMPEG.with_name(
+        "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    )
+    if not ffprobe.is_file():
+        raise FileNotFoundError(f"ffprobe was not found beside {_FFMPEG}")
+    result = run_subprocess(
+        [
+            str(ffprobe),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,codec_name",
+            "-of",
+            "json",
+            path,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    streams = json.loads(result.stdout)["streams"]
+    if not streams:
+        raise ValueError(f"video stream metadata was not found: {path}")
+    stream = streams[0]
+    metadata = (
+        int(stream["width"]),
+        int(stream["height"]),
+        str(stream.get("codec_name", "")).lower(),
+    )
+    _VIDEO_METADATA_CACHE[path] = metadata
+    return metadata
+
+
+def should_use_cuda_decode(path: str) -> bool:
+    if not _CUDA_DECODE_ENABLED or _FFMPEG is None:
+        return False
+    if _HW_DECODE_SETTING in {"0", "false", "off", "no"}:
+        return False
+    width, height, codec = video_metadata(path)
+    if _HW_DECODE_SETTING in {"1", "true", "on", "yes", "force"}:
+        return True
+    return (
+        width * height >= _HW_DECODE_MIN_PIXELS
+        and codec in {"av1", "h264", "hevc", "mpeg2video", "vp9"}
+    )
+
+
+def cuda_video_frames(
+    path: str,
+    max_frames: int,
+    total_pixels: int,
+    start_time: float,
+    end_time: float,
+) -> list[Image.Image]:
+    """Decode and shrink one high-resolution span through NVIDIA NVDEC."""
+
+    if _FFMPEG is None:
+        raise FileNotFoundError("ffmpeg was not found for hardware decoding")
+    duration = end_time - start_time
+    if duration <= 0:
+        raise ValueError(f"invalid video span: {start_time}..{end_time}")
+    width, height, _ = video_metadata(path)
+    target_height, target_width = video_frame_dimensions(
+        height, width, max_frames, total_pixels
+    )
+    filter_graph = (
+        f"fps={max_frames}/{duration:.9f},"
+        f"scale_cuda={target_width}:{target_height}:format=nv12,"
+        "hwdownload,format=nv12,format=rgb24"
+    )
+    result = run_subprocess(
+        [
+            str(_FFMPEG),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-ss",
+            f"{start_time:.6f}",
+            "-t",
+            f"{duration:.6f}",
+            "-hwaccel",
+            "cuda",
+            "-hwaccel_output_format",
+            "cuda",
+            "-i",
+            path,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            filter_graph,
+            "-frames:v",
+            str(max_frames),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        timeout=max(60.0, duration * 3),
+    )
+    frame_bytes = target_width * target_height * 3
+    if len(result.stdout) % frame_bytes != 0:
+        raise ValueError(
+            f"hardware decoder returned {len(result.stdout)} malformed bytes"
+        )
+    count = len(result.stdout) // frame_bytes
+    if count == 0:
+        raise ValueError(f"hardware decoder returned no frames: {path}")
+    return [
+        Image.frombytes(
+            "RGB",
+            (target_width, target_height),
+            result.stdout[offset : offset + frame_bytes],
+        )
+        for offset in range(0, len(result.stdout), frame_bytes)
+    ]
+
+
+def cuda_span_payloads(
+    source_spans: list[tuple[int, dict]],
+    max_frames: int,
+    total_pixels: int,
+) -> list[tuple[int, dict]]:
+    """Keep two NVDEC sessions fed without overwhelming decoder memory."""
+
+    def decode(item: tuple[int, dict]) -> tuple[int, dict]:
+        position, span = item
+        frames = cuda_video_frames(
+            span["path"],
+            max_frames,
+            total_pixels,
+            float(span["start_time"]),
+            float(span["end_time"]),
+        )
+        return position, {"video": frames}
+
+    with ThreadPoolExecutor(
+        max_workers=min(_DECODE_WORKERS, len(source_spans))
+    ) as executor:
+        return list(executor.map(decode, source_spans))
+
+
 def video_reader(path: str) -> VideoReader:
     """Reuse open decoders while indexing consecutive spans of one source."""
 
@@ -113,9 +322,97 @@ def video_frame_indices(
     return np.linspace(first, last, count, dtype=int)
 
 
+def video_frame_dimensions(
+    height: int,
+    width: int,
+    frame_count: int,
+    total_pixels: int,
+) -> tuple[int, int]:
+    """Choose a Qwen-native frame size before expensive Torch preprocessing.
+
+    qwen-vl-utils first aligns list-backed video frames to 64 pixels and later
+    aligns video tensors to 32. Returning a 64-aligned size inside the model's
+    video pixel budget makes both downstream resize passes no-ops while keeping
+    the source aspect ratio close.
+    """
+
+    if height <= 0 or width <= 0 or frame_count <= 0:
+        raise ValueError("video frame dimensions and count must be positive")
+    max_pixels = max(
+        min(_VIDEO_MAX_PIXELS, total_pixels / frame_count * 2),
+        int(_VIDEO_MIN_PIXELS * 1.05),
+    )
+    source_ratio = width / height
+    max_units = max(1, int(max_pixels // (_VIDEO_PATCH_FACTOR**2)))
+    min_units = max(1, int(np.ceil(_VIDEO_MIN_PIXELS / (_VIDEO_PATCH_FACTOR**2))))
+    best: tuple[float, int, int, int] | None = None
+    for height_units in range(1, max_units + 1):
+        for width_units in range(1, max_units // height_units + 1):
+            area_units = height_units * width_units
+            if area_units < min_units:
+                continue
+            ratio = width_units / height_units
+            aspect_error = abs(np.log(ratio / source_ratio))
+            area_penalty = 0.05 * (1 - area_units / max_units)
+            candidate = (
+                float(aspect_error + area_penalty),
+                -area_units,
+                height_units,
+                width_units,
+            )
+            if best is None or candidate < best:
+                best = candidate
+    if best is None:
+        scale = (max_pixels / (height * width)) ** 0.5
+        return max(2, int(height * scale)), max(2, int(width * scale))
+    return best[2] * _VIDEO_PATCH_FACTOR, best[3] * _VIDEO_PATCH_FACTOR
+
+
+def resize_video_frames(
+    frames: np.ndarray,
+    frame_count: int,
+    total_pixels: int,
+) -> list[Image.Image]:
+    """Resize decoded frames in Pillow's native threads and detach the batch."""
+
+    if len(frames) == 0:
+        return []
+    target_height, target_width = video_frame_dimensions(
+        int(frames.shape[1]),
+        int(frames.shape[2]),
+        frame_count,
+        total_pixels,
+    )
+
+    return resize_frame_tasks(
+        [(frame, target_height, target_width) for frame in frames]
+    )
+
+
+def resize_frame_tasks(
+    tasks: list[tuple[np.ndarray, int, int]],
+) -> list[Image.Image]:
+    """Resize differently sized span groups through one shared native pool."""
+
+    def resize(task: tuple[np.ndarray, int, int]) -> Image.Image:
+        frame, target_height, target_width = task
+        image = Image.fromarray(frame)
+        if image.size == (target_width, target_height):
+            return image.copy()
+        return image.resize(
+            (target_width, target_height), Image.Resampling.BILINEAR
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=min(_RESIZE_WORKERS, len(tasks))
+    ) as executor:
+        return list(executor.map(resize, tasks))
+
+
 def video_frames(
     path: str,
     max_frames: int,
+    total_pixels: int,
     start_time: float | None = None,
     end_time: float | None = None,
 ) -> list[Image.Image]:
@@ -129,10 +426,13 @@ def video_frames(
     indices = video_frame_indices(
         reader, path, max_frames, start_time, end_time
     )
-    return [Image.fromarray(frame) for frame in reader.get_batch(indices).asnumpy()]
+    frames = reader.get_batch(indices).asnumpy()
+    return resize_video_frames(frames, len(indices), total_pixels)
 
 
-def video_span_payloads(spans: list[dict], max_frames: int) -> list[dict]:
+def video_span_payloads(
+    spans: list[dict], max_frames: int, total_pixels: int
+) -> list[dict]:
     """Decode all spans from each source with one batched decoder request."""
 
     payloads: list[dict] = [{} for _ in spans]
@@ -141,6 +441,20 @@ def video_span_payloads(spans: list[dict], max_frames: int) -> list[dict]:
         spans_by_path.setdefault(item["path"], []).append((position, item))
 
     for path, source_spans in spans_by_path.items():
+        try:
+            if should_use_cuda_decode(path):
+                for position, payload in cuda_span_payloads(
+                    source_spans, max_frames, total_pixels
+                ):
+                    payloads[position] = payload
+                continue
+        except Exception as error:
+            print(
+                f"PastVideo NVDEC fallback for {path!r}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         reader = video_reader(path)
         all_indices: list[int] = []
         slices: list[tuple[int, int, int]] = []
@@ -157,13 +471,26 @@ def video_span_payloads(spans: list[dict], max_frames: int) -> list[dict]:
             slices.append((position, start, len(indices)))
 
         frames = reader.get_batch(np.asarray(all_indices, dtype=int)).asnumpy()
-        for position, start, count in slices:
+        resize_tasks: list[tuple[np.ndarray, int, int]] = []
+        for _, start, count in slices:
+            target_height, target_width = video_frame_dimensions(
+                int(frames.shape[1]),
+                int(frames.shape[2]),
+                count,
+                total_pixels,
+            )
+            resize_tasks.extend(
+                (frame, target_height, target_width)
+                for frame in frames[start : start + count]
+            )
+        resized = resize_frame_tasks(resize_tasks)
+        del frames
+        resized_start = 0
+        for position, _, count in slices:
             payloads[position] = {
-                "video": [
-                    Image.fromarray(frame)
-                    for frame in frames[start : start + count]
-                ]
+                "video": resized[resized_start : resized_start + count]
             }
+            resized_start += count
     return payloads
 
 
@@ -176,7 +503,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def embed_payloads(model, payloads: list[dict]) -> tuple[list[list[float]], int]:
+    """Run one model batch and promptly release its temporary tensors."""
+
+    inference_started = time.perf_counter()
+    values = model.process(payloads)
+    embeddings = [value.float().cpu().tolist() for value in values]
+    inference_ms = round((time.perf_counter() - inference_started) * 1000)
+    del values
+    return embeddings, inference_ms
+
+
 def main() -> int:
+    global _CUDA_DECODE_ENABLED
+
     # Rust speaks UTF-8 JSON-lines. Python otherwise inherits the Windows ANSI
     # pipe encoding, which corrupts CJK paths into surrogate characters.
     if hasattr(sys.stdin, "reconfigure"):
@@ -195,6 +535,11 @@ def main() -> int:
     from qwen3_vl_embedding import Qwen3VLEmbedder  # type: ignore
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    _CUDA_DECODE_ENABLED = (
+        device == "cuda"
+        and _FFMPEG is not None
+        and _HW_DECODE_SETTING not in {"0", "false", "off", "no"}
+    )
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     started = time.perf_counter()
     model = Qwen3VLEmbedder(
@@ -213,6 +558,9 @@ def main() -> int:
             "ready": True,
             "device": device,
             "gpu": gpu,
+            "video_decoder": (
+                "adaptive-nvdec" if _CUDA_DECODE_ENABLED else "decord"
+            ),
             "dimensions": 2048,
             "load_ms": round((time.perf_counter() - started) * 1000),
         }
@@ -233,21 +581,32 @@ def main() -> int:
                     payload = {"image": image.convert("RGB").copy()}
             elif operation == "video":
                 payload = {
-                    "video": video_frames(request["path"], args.max_frames)
+                    "video": video_frames(
+                        request["path"], args.max_frames, args.total_pixels
+                    )
                 }
             elif operation == "video_batch":
+                decode_started = time.perf_counter()
                 payloads = [
-                    {"video": video_frames(path, args.max_frames)}
+                    {
+                        "video": video_frames(
+                            path, args.max_frames, args.total_pixels
+                        )
+                    }
                     for path in request["paths"]
                 ]
-                embeddings = [
-                    value.float().cpu().tolist()
-                    for value in model.process(payloads)
-                ]
+                decode_ms = round(
+                    (time.perf_counter() - decode_started) * 1000
+                )
+                embeddings, inference_ms = embed_payloads(model, payloads)
+                del payloads
+                gc.collect()
                 emit(
                     {
                         "ok": True,
                         "embeddings": embeddings,
+                        "decode_ms": decode_ms,
+                        "inference_ms": inference_ms,
                         "elapsed_ms": round(
                             (time.perf_counter() - started) * 1000
                         ),
@@ -255,17 +614,22 @@ def main() -> int:
                 )
                 continue
             elif operation == "video_span_batch":
+                decode_started = time.perf_counter()
                 payloads = video_span_payloads(
-                    request["spans"], args.max_frames
+                    request["spans"], args.max_frames, args.total_pixels
                 )
-                embeddings = [
-                    value.float().cpu().tolist()
-                    for value in model.process(payloads)
-                ]
+                decode_ms = round(
+                    (time.perf_counter() - decode_started) * 1000
+                )
+                embeddings, inference_ms = embed_payloads(model, payloads)
+                del payloads
+                gc.collect()
                 emit(
                     {
                         "ok": True,
                         "embeddings": embeddings,
+                        "decode_ms": decode_ms,
+                        "inference_ms": inference_ms,
                         "elapsed_ms": round(
                             (time.perf_counter() - started) * 1000
                         ),
@@ -277,14 +641,14 @@ def main() -> int:
                     {"text": text, "instruction": RETRIEVAL_INSTRUCTION}
                     for text in request["texts"]
                 ]
-                embeddings = [
-                    value.float().cpu().tolist()
-                    for value in model.process(payloads)
-                ]
+                embeddings, inference_ms = embed_payloads(model, payloads)
+                del payloads
+                gc.collect()
                 emit(
                     {
                         "ok": True,
                         "embeddings": embeddings,
+                        "inference_ms": inference_ms,
                         "elapsed_ms": round(
                             (time.perf_counter() - started) * 1000
                         ),
