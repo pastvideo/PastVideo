@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use pastvideo::{default_embedder, Config, Database, HighlightMethod, VideoSpan};
+use pastvideo::{default_embedder, Config, Database, DeadLetterQueue, HighlightMethod, VideoSpan};
 
 fn ffmpeg_available() -> bool {
     pastvideo::chunker::find_ffmpeg().is_ok()
@@ -122,6 +122,18 @@ fn end_to_end_index_search_trim() {
     // Stats reflect both files.
     let stats = db.stats().unwrap();
     assert_eq!(stats.unique_source_files, 2);
+
+    let db_path = tmp.path().join("db").join("pastvideo.db");
+    let dlq = DeadLetterQueue::open(&db_path).unwrap();
+    dlq.record("failed", "/failed.mp4", 0.0, 5.0, "test", 3)
+        .unwrap();
+    drop(dlq);
+    db.reset().unwrap();
+    assert_eq!(db.stats().unwrap().total_chunks, 0);
+    assert!(DeadLetterQueue::open(&db_path).unwrap().is_empty().unwrap());
+
+    let reindexed = db.insert_video(&red).unwrap();
+    assert!(reindexed.new_chunks > 0, "reset must allow a clean reindex");
 }
 
 #[test]

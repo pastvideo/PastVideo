@@ -249,6 +249,11 @@ impl SentryStore {
         Ok(n)
     }
 
+    /// Remove every indexed chunk in one SQLite statement.
+    pub fn clear(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM chunks", [])?)
+    }
+
     pub fn stats(&self) -> Result<Stats> {
         let total = self.count()?;
         if total == 0 {
@@ -406,5 +411,8 @@ mod tests {
         let hits = store.search(&q, 2, false).unwrap();
         assert_eq!(hits[0].source_file, "/a.mp4");
         assert!(hits[0].score > hits[1].score);
+
+        assert_eq!(store.clear().unwrap(), 2);
+        assert_eq!(store.count().unwrap(), 0);
     }
 }

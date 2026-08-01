@@ -12,8 +12,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{Error, Result};
 
 pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &[
-    ".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".wmv", ".mts", ".m2ts", ".mpg", ".mpeg",
-    ".3gp", ".3g2", ".flv", ".f4v", ".ogv", ".vob",
+    ".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".wmv", ".mpg", ".mpeg", ".3gp", ".3g2",
+    ".flv", ".f4v", ".ogv", ".vob",
+];
+
+/// Generated dependency/cache trees do not contain user-owned source media.
+/// Skipping them keeps selecting a project or home folder responsive. A user
+/// can still scan one directly by choosing that directory as the root.
+const SKIPPED_SCAN_DIRECTORY_NAMES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".next",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "target",
+    "venv",
 ];
 
 /// Number of frames the baseline embedder samples per chunk.
@@ -473,7 +488,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if file_type.is_dir() {
+        if file_type.is_dir() && !is_skipped_scan_directory(&p) {
             walk(&p, out);
         } else if file_type.is_file() && is_supported_video_file(&p) {
             out.push(p);
@@ -488,6 +503,16 @@ pub fn is_supported_video_file(path: &Path) -> bool {
             SUPPORTED_VIDEO_EXTENSIONS
                 .iter()
                 .any(|supported| extension.eq_ignore_ascii_case(supported.trim_start_matches('.')))
+        })
+}
+
+fn is_skipped_scan_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            SKIPPED_SCAN_DIRECTORY_NAMES
+                .iter()
+                .any(|skipped| name.eq_ignore_ascii_case(skipped))
         })
 }
 
@@ -545,6 +570,8 @@ mod tests {
         assert!(is_supported_video_file(Path::new("/a/b.mkv")));
         assert!(is_supported_video_file(Path::new("/a/b.WEBM")));
         assert!(is_supported_video_file(Path::new("/a/b.mpeg")));
+        assert!(!is_supported_video_file(Path::new("/a/camera.mts")));
+        assert!(!is_supported_video_file(Path::new("/a/camera.m2ts")));
         assert!(!is_supported_video_file(Path::new("/a/b.txt")));
         assert!(!is_supported_video_file(Path::new("/a/b.mp4.txt")));
         assert!(!is_supported_video_file(Path::new("/a/b")));
@@ -565,8 +592,25 @@ mod tests {
         }
         fs::create_dir(temp.path().join("not-a-file.mp4")).unwrap();
 
+        for directory in [".git", "node_modules", "target"] {
+            let generated = temp.path().join(directory);
+            fs::create_dir(&generated).unwrap();
+            fs::write(generated.join("generated.mp4"), b"not source media").unwrap();
+        }
+
         let found = scan_directory(temp.path());
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn explicitly_selected_generated_directory_is_still_scanned() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let video = target.join("explicit.mp4");
+        fs::write(&video, b"test fixture").unwrap();
+
+        assert_eq!(scan_directory(&target), vec![video]);
     }
 
     #[test]

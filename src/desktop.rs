@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use crate::catalog::CATEGORY_DEFINITIONS;
 use crate::catalog::{
-    apply_categories, build_category_embeddings, format_duration, load_categories, make_thumbnail,
-    save_categories, scan_folder, semantic_categories, semantic_categories_with_embeddings,
-    semantic_category_for_source, Thumbnail, VideoInfo,
+    apply_categories, build_category_embeddings, format_duration, infer_category, load_categories,
+    make_thumbnail, save_categories, scan_folder, semantic_categories,
+    semantic_categories_with_embeddings, semantic_category_for_source, Thumbnail, VideoInfo,
 };
 use crate::chunker::find_ffmpeg;
 use crate::provider::{create_embedder, EmbeddingProvider, EmbeddingSettings};
@@ -43,6 +43,7 @@ struct Preferences {
 enum TaskKind {
     Scanning,
     Indexing,
+    ClearingIndex,
     TestingProvider,
 }
 
@@ -51,6 +52,7 @@ impl TaskKind {
         match self {
             Self::Scanning => "Scanning folder",
             Self::Indexing => "Indexing videos",
+            Self::ClearingIndex => "Clearing index",
             Self::TestingProvider => "Testing connection",
         }
     }
@@ -68,6 +70,7 @@ enum WorkerMessage {
     IndexProgress(IndexProgress),
     CategoriesUpdated(HashMap<String, String>),
     IndexFinished(std::result::Result<IndexOutcome, String>),
+    IndexCleared(std::result::Result<i64, String>),
     SearchFinished(std::result::Result<Vec<Match>, String>),
     ProviderTestFinished(std::result::Result<String, String>),
 }
@@ -95,6 +98,7 @@ pub struct PastVideoApp {
     index_progress: Option<IndexProgress>,
     notice: Option<(String, bool)>,
     settings_open: bool,
+    clear_index_confirm: bool,
     persist_preferences: bool,
     repaint: egui::Context,
     tx: Sender<WorkerMessage>,
@@ -131,6 +135,7 @@ impl PastVideoApp {
             index_progress: None,
             notice: None,
             settings_open: false,
+            clear_index_confirm: false,
             persist_preferences: e2e_folder.is_none(),
             repaint: cc.egui_ctx.clone(),
             tx,
@@ -336,6 +341,40 @@ impl PastVideoApp {
         });
     }
 
+    fn start_clear_index(&mut self) {
+        if self.task.is_some() || self.searching {
+            return;
+        }
+        let settings = self.preferences.embedding.clone();
+        let embedder = match self.get_shared_embedder(&settings) {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                self.notice = Some((friendly_error(&error), true));
+                return;
+            }
+        };
+        let data_dir = self.data_dir(&settings);
+        let categories_path = self.categories_path(&settings);
+        let tx = self.tx.clone();
+        self.task = Some(TaskKind::ClearingIndex);
+        self.clear_index_confirm = false;
+        self.notice = None;
+        thread::spawn(move || {
+            let result = (|| -> std::result::Result<i64, String> {
+                let db = Database::with_embedder(&data_dir, embedder.boxed())
+                    .map_err(|error| error.to_string())?;
+                let moments = db.stats().map_err(|error| error.to_string())?.total_chunks;
+                db.reset().map_err(|error| error.to_string())?;
+                if categories_path.is_file() {
+                    fs::remove_file(&categories_path)
+                        .map_err(|error| format!("could not clear saved categories: {error}"))?;
+                }
+                Ok(moments)
+            })();
+            let _ = tx.send(WorkerMessage::IndexCleared(result));
+        });
+    }
+
     fn start_provider_test(&mut self) {
         let settings = self.settings_draft.clone();
         let tx = self.tx.clone();
@@ -407,6 +446,29 @@ impl PastVideoApp {
                                     outcome.report.new_chunks,
                                     outcome.report.files_indexed,
                                     outcome.report.total_chunks
+                                ),
+                                false,
+                            ));
+                        }
+                        Err(error) => self.notice = Some((friendly_error(&error), true)),
+                    }
+                }
+                WorkerMessage::IndexCleared(result) => {
+                    self.task = None;
+                    self.index_progress = None;
+                    match result {
+                        Ok(moments) => {
+                            self.search_query.clear();
+                            self.searched_query = None;
+                            self.search_results.clear();
+                            self.selected_match = None;
+                            self.category_filter = None;
+                            for video in &mut self.videos {
+                                video.category = infer_category(&video.path).to_owned();
+                            }
+                            self.notice = Some((
+                                format!(
+                                    "Cleared {moments} indexed moments. Source videos were not changed."
                                 ),
                                 false,
                             ));
@@ -1251,6 +1313,37 @@ impl PastVideoApp {
                 ui.add_space(20.0);
                 ui.separator();
                 ui.add_space(12.0);
+                ui.label(
+                    RichText::new("INDEX MANAGEMENT")
+                        .monospace()
+                        .size(9.0)
+                        .color(MUTED),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Clear the {} index to rebuild it from scratch. Your video files stay untouched.",
+                        self.preferences.embedding.provider.short_label()
+                    ))
+                    .size(10.0)
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                if ui
+                    .add_enabled(
+                        self.task.is_none() && !self.searching,
+                        egui::Button::new(
+                            RichText::new("Clear current index").strong().color(CREAM),
+                        )
+                        .fill(Color32::from_rgb(91, 43, 34)),
+                    )
+                    .clicked()
+                {
+                    self.clear_index_confirm = true;
+                    self.settings_open = false;
+                }
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
@@ -1278,6 +1371,63 @@ impl PastVideoApp {
                 });
             });
         self.settings_open = open && self.settings_open;
+    }
+
+    fn show_clear_index_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.clear_index_confirm {
+            return;
+        }
+        let mut decision = None;
+        egui::Window::new("Clear current index?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(410.0)
+            .frame(
+                egui::Frame::window(&ctx.style_of(egui::Theme::Dark))
+                    .fill(PANEL_RAISED)
+                    .inner_margin(egui::Margin::same(22)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("All indexed moments, search vectors, saved categories, and failed-item records for the current provider will be removed.")
+                        .size(12.0)
+                        .color(CREAM),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Source videos are never deleted. You can run Index folder again afterward.")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Clear index").strong().color(CREAM),
+                                )
+                                .fill(Color32::from_rgb(120, 47, 35)),
+                            )
+                            .clicked()
+                        {
+                            decision = Some(true);
+                        }
+                    });
+                });
+            });
+        match decision {
+            Some(true) => self.start_clear_index(),
+            Some(false) => {
+                self.clear_index_confirm = false;
+                self.settings_open = true;
+            }
+            None => {}
+        }
     }
 
     fn show_notice(&mut self, root: &mut egui::Ui) {
@@ -1357,6 +1507,7 @@ impl eframe::App for PastVideoApp {
                 }
             });
         self.show_settings(&ctx);
+        self.show_clear_index_confirmation(&ctx);
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {

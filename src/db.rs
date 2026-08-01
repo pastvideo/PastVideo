@@ -798,12 +798,10 @@ impl Database {
         self.store.stats()
     }
 
-    /// Wipe all indexed chunks (the dead-letter queue is left intact).
+    /// Wipe all indexed chunks and failed-chunk records, ready for reindexing.
     pub fn reset(&self) -> Result<()> {
-        let s = self.store.stats()?;
-        for f in s.source_files {
-            self.store.remove_file(&f)?;
-        }
+        self.store.clear()?;
+        self.dlq.clear()?;
         Ok(())
     }
 
