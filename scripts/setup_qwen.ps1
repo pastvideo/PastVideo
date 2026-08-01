@@ -33,6 +33,7 @@ uv pip install --python $python `
     "sentence-transformers[video]==5.5.1" `
     "qwen-vl-utils==0.0.14" `
     "decord==0.6.0" `
+    "PyNvVideoCodec==2.2.0" `
     "modelscope>=1.39.0"
 
 $modelFile = Join-Path $ModelDir "model.safetensors"

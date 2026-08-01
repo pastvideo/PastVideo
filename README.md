@@ -152,12 +152,18 @@ Override them with `PASTVIDEO_QWEN_PYTHON`, `PASTVIDEO_QWEN_MODEL`, and
 video chunk (default 16). Video batch size scales automatically with detected
 VRAM (10 on a 24 GB card); `PASTVIDEO_QWEN_BATCH_SIZE` overrides it.
 
-High-resolution local videos use NVIDIA NVDEC automatically, while smaller
-sources keep the faster cached CPU decoder. Frames are reduced to Qwen's native
-token resolution before Torch preprocessing to avoid full-resolution CPU tensor
-spikes. Set `PASTVIDEO_QWEN_HW_DECODE=off` to disable NVDEC, or tune
-`PASTVIDEO_QWEN_HW_DECODE_MIN_PIXELS`, `PASTVIDEO_QWEN_DECODE_WORKERS`, and
-`PASTVIDEO_QWEN_RESIZE_THREADS` for unusual hardware.
+1080p and larger local videos use PyNvVideoCodec's random-access NVIDIA NVDEC
+path automatically. It samples sparse frames directly on the GPU, resizes them
+there, and copies only model-sized frames to CPU memory. FFmpeg NVDEC and Decord
+remain automatic fallbacks for unsupported codecs and systems. The default
+fast-indexing resolution uses 1,048,576 total video pixels (512x256 for typical
+16:9 input) with aspect-preserving padding, reducing Qwen's spatial tokens by
+about 29%. Set `PASTVIDEO_QWEN_TOTAL_PIXELS=1843200` for the previous quality
+level, `PASTVIDEO_QWEN_HW_DECODE=off` to disable NVDEC, or tune
+`PASTVIDEO_QWEN_HW_DECODE_MIN_PIXELS`,
+`PASTVIDEO_QWEN_FFMPEG_HW_DECODE_MIN_PIXELS`,
+`PASTVIDEO_QWEN_DECODE_WORKERS`, and `PASTVIDEO_QWEN_RESIZE_THREADS` for unusual
+hardware.
 
 The setup script prefers an existing CUDA-enabled PyTorch wheel from the local
 uv cache, otherwise installs the common CUDA 12.8 PyTorch toolset into the shared

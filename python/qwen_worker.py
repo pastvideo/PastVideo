@@ -23,22 +23,33 @@ import traceback
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from decord import VideoReader
-from PIL import Image
+from PIL import Image, ImageOps
+
+try:
+    import PyNvVideoCodec as nvc  # type: ignore
+except (ImportError, OSError):
+    nvc = None
 
 
 RETRIEVAL_INSTRUCTION = "Retrieve video clips relevant to the user's query."
 _ALIAS_DIR = tempfile.TemporaryDirectory(prefix="pastvideo-qwen-")
 _ALIAS_CACHE: dict[str, str] = {}
 _VIDEO_READER_CACHE: OrderedDict[str, VideoReader] = OrderedDict()
+_NVC_DECODER_CACHE: OrderedDict[str, Any] = OrderedDict()
 _VIDEO_METADATA_CACHE: dict[str, tuple[int, int, str]] = {}
 _MAX_CACHED_VIDEO_READERS = 2
+_MAX_CACHED_NVC_DECODERS = 2
 _VIDEO_PATCH_FACTOR = 64
 _VIDEO_MIN_PIXELS = 128 * 32 * 32
 _VIDEO_MAX_PIXELS = 768 * 32 * 32
+_DEFAULT_TOTAL_PIXELS = int(
+    os.environ.get("PASTVIDEO_QWEN_TOTAL_PIXELS", "1048576")
+)
 _RESIZE_WORKERS = max(
     1,
     min(
@@ -48,13 +59,16 @@ _RESIZE_WORKERS = max(
 )
 _DECODE_WORKERS = max(
     1,
-    min(2, int(os.environ.get("PASTVIDEO_QWEN_DECODE_WORKERS", "2"))),
+    min(4, int(os.environ.get("PASTVIDEO_QWEN_DECODE_WORKERS", "3"))),
 )
 _HW_DECODE_SETTING = os.environ.get(
     "PASTVIDEO_QWEN_HW_DECODE", "auto"
 ).strip().lower()
 _HW_DECODE_MIN_PIXELS = int(
-    os.environ.get("PASTVIDEO_QWEN_HW_DECODE_MIN_PIXELS", "3000000")
+    os.environ.get("PASTVIDEO_QWEN_HW_DECODE_MIN_PIXELS", "1500000")
+)
+_FFMPEG_HW_DECODE_MIN_PIXELS = int(
+    os.environ.get("PASTVIDEO_QWEN_FFMPEG_HW_DECODE_MIN_PIXELS", "3000000")
 )
 _CUDA_DECODE_ENABLED = False
 _SUBPROCESS_FLAGS = (
@@ -83,6 +97,7 @@ def close_video_readers() -> None:
     """Release Windows file handles before the temporary alias directory."""
 
     _VIDEO_READER_CACHE.clear()
+    _NVC_DECODER_CACHE.clear()
     gc.collect()
 
 
@@ -124,6 +139,40 @@ def run_subprocess(command: list[str], **kwargs) -> subprocess.CompletedProcess:
     if os.name == "nt":
         kwargs["creationflags"] = _SUBPROCESS_FLAGS
     return subprocess.run(command, **kwargs)
+
+
+def nvc_video_decoder(path: str):
+    """Return a cached random-access NVDEC decoder for one source."""
+
+    if nvc is None:
+        raise RuntimeError("PyNvVideoCodec is not installed")
+    safe_path = decoder_path(path)
+    cached = _NVC_DECODER_CACHE.get(safe_path)
+    if cached is not None:
+        _NVC_DECODER_CACHE.move_to_end(safe_path)
+        return cached
+    decoder = nvc.CreateSimpleDecoder(
+        safe_path,
+        0,
+        0,
+        0,
+        True,
+        0,
+        0,
+        False,
+        _MAX_CACHED_NVC_DECODERS,
+        nvc.OutputColorType.RGB,
+    )
+    _NVC_DECODER_CACHE[safe_path] = decoder
+    if len(_NVC_DECODER_CACHE) > _MAX_CACHED_NVC_DECODERS:
+        _NVC_DECODER_CACHE.popitem(last=False)
+    return decoder
+
+
+def discard_nvc_video_decoder(path: str) -> None:
+    safe_path = _ALIAS_CACHE.get(path, path)
+    _NVC_DECODER_CACHE.pop(safe_path, None)
+    gc.collect()
 
 
 def video_metadata(path: str) -> tuple[int, int, str]:
@@ -171,6 +220,20 @@ def video_metadata(path: str) -> tuple[int, int, str]:
 
 def should_use_cuda_decode(path: str) -> bool:
     if not _CUDA_DECODE_ENABLED or _FFMPEG is None:
+        return False
+    if _HW_DECODE_SETTING in {"0", "false", "off", "no"}:
+        return False
+    width, height, codec = video_metadata(path)
+    if _HW_DECODE_SETTING in {"1", "true", "on", "yes", "force"}:
+        return True
+    return (
+        width * height >= _FFMPEG_HW_DECODE_MIN_PIXELS
+        and codec in {"av1", "h264", "hevc", "mpeg2video", "vp9"}
+    )
+
+
+def should_use_nvc_decode(path: str) -> bool:
+    if not _CUDA_DECODE_ENABLED or nvc is None:
         return False
     if _HW_DECODE_SETTING in {"0", "false", "off", "no"}:
         return False
@@ -312,12 +375,14 @@ def video_frame_indices(
     if len(reader) == 0:
         raise ValueError(f"video contains no frames: {path}")
     fps = max(float(reader.get_avg_fps()), 0.001)
-    first = 0 if start_time is None else max(0, int(start_time * fps))
+    first = (
+        0
+        if start_time is None
+        else min(len(reader) - 1, max(0, int(start_time * fps)))
+    )
     last = len(reader) - 1
     if end_time is not None:
         last = min(last, max(first, int(end_time * fps) - 1))
-    if first >= len(reader):
-        raise ValueError(f"video span starts beyond the file: {path} @ {start_time}")
     count = min(max_frames, last - first + 1)
     return np.linspace(first, last, count, dtype=int)
 
@@ -399,14 +464,95 @@ def resize_frame_tasks(
         image = Image.fromarray(frame)
         if image.size == (target_width, target_height):
             return image.copy()
-        return image.resize(
-            (target_width, target_height), Image.Resampling.BILINEAR
+        return ImageOps.pad(
+            image,
+            (target_width, target_height),
+            method=Image.Resampling.BILINEAR,
+            color=(0, 0, 0),
         )
 
     with ThreadPoolExecutor(
         max_workers=min(_RESIZE_WORKERS, len(tasks))
     ) as executor:
         return list(executor.map(resize, tasks))
+
+
+def resize_nvc_frames(
+    frames: list[Any], target_height: int, target_width: int
+) -> list[Image.Image]:
+    """Resize NVDEC frames on CUDA, then copy only model-sized RGB frames."""
+
+    if not frames:
+        return []
+    views = [torch.from_dlpack(frame) for frame in frames]
+    source_height, source_width = int(views[0].shape[0]), int(views[0].shape[1])
+    scale = min(target_width / source_width, target_height / source_height)
+    fitted_width = max(1, min(target_width, round(source_width * scale)))
+    fitted_height = max(1, min(target_height, round(source_height * scale)))
+    batch = torch.stack(views).permute(0, 3, 1, 2).float()
+    del views, frames
+    resized = torch.nn.functional.interpolate(
+        batch,
+        size=(fitted_height, fitted_width),
+        mode="bilinear",
+        align_corners=False,
+    ).to(torch.uint8)
+    del batch
+    pad_left = (target_width - fitted_width) // 2
+    pad_right = target_width - fitted_width - pad_left
+    pad_top = (target_height - fitted_height) // 2
+    pad_bottom = target_height - fitted_height - pad_top
+    if pad_left or pad_right or pad_top or pad_bottom:
+        resized = torch.nn.functional.pad(
+            resized,
+            (pad_left, pad_right, pad_top, pad_bottom),
+            value=0,
+        )
+    host_frames = resized.cpu().permute(0, 2, 3, 1).contiguous()
+    del resized
+    images = [Image.fromarray(frame.numpy()).copy() for frame in host_frames]
+    del host_frames
+    return images
+
+
+def nvc_span_payloads(
+    source_spans: list[tuple[int, dict]],
+    max_frames: int,
+    total_pixels: int,
+) -> list[tuple[int, dict]]:
+    """Random-sample spans through NVDEC without materializing CPU HD frames."""
+
+    path = source_spans[0][1]["path"]
+    decoder = nvc_video_decoder(path)
+    metadata = decoder.get_stream_metadata()
+    fps = max(float(metadata.average_fps), 0.001)
+    frame_count = int(metadata.num_frames)
+    if frame_count <= 0:
+        frame_count = max(1, int(float(metadata.duration) * fps))
+    height, width = int(metadata.height), int(metadata.width)
+    payloads: list[tuple[int, dict]] = []
+    for position, span in source_spans:
+        first = min(
+            frame_count - 1,
+            max(0, int(float(span["start_time"]) * fps)),
+        )
+        last = min(
+            frame_count - 1,
+            max(first, int(float(span["end_time"]) * fps) - 1),
+        )
+        count = min(max_frames, last - first + 1)
+        indices = np.linspace(first, last, count, dtype=int).tolist()
+        frames = decoder.get_batch_frames_by_index(indices)
+        if len(frames) != count:
+            raise ValueError(
+                f"NVDEC returned {len(frames)} of {count} requested frames"
+            )
+        target_height, target_width = video_frame_dimensions(
+            height, width, count, total_pixels
+        )
+        images = resize_nvc_frames(frames, target_height, target_width)
+        payloads.append((position, {"video": images}))
+    return payloads
 
 
 def video_frames(
@@ -441,6 +587,21 @@ def video_span_payloads(
         spans_by_path.setdefault(item["path"], []).append((position, item))
 
     for path, source_spans in spans_by_path.items():
+        try:
+            if should_use_nvc_decode(path):
+                for position, payload in nvc_span_payloads(
+                    source_spans, max_frames, total_pixels
+                ):
+                    payloads[position] = payload
+                continue
+        except Exception as error:
+            discard_nvc_video_decoder(path)
+            print(
+                f"PastVideo PyNvVideoCodec fallback for {path!r}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         try:
             if should_use_cuda_decode(path):
                 for position, payload in cuda_span_payloads(
@@ -499,7 +660,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--max-frames", type=int, default=16)
     parser.add_argument("--max-pixels", type=int, default=230_400)
-    parser.add_argument("--total-pixels", type=int, default=1_843_200)
+    parser.add_argument("--total-pixels", type=int, default=_DEFAULT_TOTAL_PIXELS)
     return parser.parse_args()
 
 
@@ -537,7 +698,7 @@ def main() -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _CUDA_DECODE_ENABLED = (
         device == "cuda"
-        and _FFMPEG is not None
+        and (_FFMPEG is not None or nvc is not None)
         and _HW_DECODE_SETTING not in {"0", "false", "off", "no"}
     )
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
@@ -559,8 +720,13 @@ def main() -> int:
             "device": device,
             "gpu": gpu,
             "video_decoder": (
-                "adaptive-nvdec" if _CUDA_DECODE_ENABLED else "decord"
+                "random-access-nvdec"
+                if _CUDA_DECODE_ENABLED and nvc is not None
+                else "adaptive-nvdec"
+                if _CUDA_DECODE_ENABLED
+                else "decord"
             ),
+            "total_pixels": args.total_pixels,
             "dimensions": 2048,
             "load_ms": round((time.perf_counter() - started) * 1000),
         }
