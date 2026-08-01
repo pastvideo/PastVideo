@@ -277,9 +277,14 @@ fn direct_span_backend_fills_requests_across_videos_and_reports_live_progress() 
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    make_color_video(&tmp.path().join("blue.mp4"), "blue", 4);
-    make_color_video(&tmp.path().join("green.mp4"), "green", 4);
-    make_color_video(&tmp.path().join("red.mp4"), "red", 4);
+    let first = tmp.path().join("first");
+    let nested = first.join("nested");
+    let second = tmp.path().join("second");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    make_color_video(&first.join("blue.mp4"), "blue", 4);
+    make_color_video(&nested.join("green.mp4"), "green", 4);
+    make_color_video(&second.join("red.mp4"), "red", 4);
     let batch_sizes = Arc::new(Mutex::new(Vec::new()));
     let backend = SpanBackend {
         batch_sizes: Arc::clone(&batch_sizes),
@@ -293,7 +298,11 @@ fn direct_span_backend_fills_requests_across_videos_and_reports_live_progress() 
     let db = Database::with_config(tmp.path().join("db"), Box::new(backend), config).unwrap();
     let mut progress = Vec::new();
     let report = db
-        .insert_dir_with_progress(tmp.path(), |update| progress.push(update))
+        .insert_dirs_with_progress_and_cancel(
+            &[first, nested, second],
+            |update| progress.push(update),
+            || false,
+        )
         .unwrap();
 
     assert_eq!(report.new_chunks, 3);

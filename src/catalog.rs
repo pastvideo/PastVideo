@@ -1,6 +1,6 @@
 //! Filesystem catalog and automatic video categories used by the desktop app.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -77,7 +77,28 @@ pub struct Thumbnail {
 }
 
 pub fn scan_folder(folder: &Path) -> Vec<VideoInfo> {
-    scan_directory(folder)
+    scan_folders(&[folder.to_path_buf()])
+}
+
+/// Scan several library roots into one deduplicated, stable catalog. Nested
+/// or overlapping roots never produce duplicate video cards.
+pub fn scan_folders(folders: &[PathBuf]) -> Vec<VideoInfo> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for folder in folders {
+        for path in scan_directory(folder) {
+            let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if seen.insert(key) {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort_by(|left, right| {
+        left.to_string_lossy()
+            .to_lowercase()
+            .cmp(&right.to_string_lossy().to_lowercase())
+    });
+    paths
         .into_iter()
         .map(|path| {
             let metadata = fs::metadata(&path).ok();
@@ -368,5 +389,30 @@ mod tests {
         assert_eq!(format_duration(65.0), "1:05");
         assert_eq!(format_duration(3665.0), "1:01:05");
         assert_eq!(format_bytes(1_048_576), "1.0 MB");
+    }
+
+    #[test]
+    fn several_and_overlapping_roots_form_one_deduplicated_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let nested = first.join("nested");
+        let second = temp.path().join("second");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("one.mp4"), []).unwrap();
+        fs::write(nested.join("two.mov"), []).unwrap();
+        fs::write(second.join("three.mkv"), []).unwrap();
+        fs::write(second.join("ignored.mts"), []).unwrap();
+
+        let catalog = scan_folders(&[first, nested, second]);
+
+        assert_eq!(catalog.len(), 3);
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|video| video.file_name.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["one.mp4", "two.mov", "three.mkv"])
+        );
     }
 }

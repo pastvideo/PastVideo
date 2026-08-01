@@ -1,12 +1,12 @@
 //! Native PastVideo desktop application built with eframe/egui.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::catalog::CATEGORY_DEFINITIONS;
 use crate::catalog::{
     apply_categories, build_category_embeddings, format_duration, infer_category, load_categories,
-    make_thumbnail, save_categories, scan_folder, semantic_categories,
-    semantic_categories_with_embeddings, semantic_category_for_source, Thumbnail, VideoInfo,
+    make_thumbnail, save_categories, semantic_categories, semantic_categories_with_embeddings,
+    semantic_category_for_source, Thumbnail, VideoInfo,
 };
 use crate::chunker::find_ffmpeg;
 use crate::provider::{create_embedder, EmbeddingProvider, EmbeddingSettings};
@@ -32,10 +32,14 @@ const MUTED: Color32 = Color32::from_rgb(158, 161, 153);
 const LINE: Color32 = Color32::from_rgb(52, 57, 54);
 const SIGNAL: Color32 = Color32::from_rgb(201, 255, 99);
 const DANGER: Color32 = Color32::from_rgb(241, 108, 73);
+const MAX_THUMBNAIL_TEXTURES: usize = 192;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Preferences {
+    folders: Vec<PathBuf>,
+    /// Retained for migration from the original single-folder settings and as
+    /// the initial directory for the next Add folder dialog.
     last_folder: Option<PathBuf>,
     embedding: EmbeddingSettings,
 }
@@ -51,7 +55,7 @@ enum TaskKind {
 impl TaskKind {
     fn label(self) -> &'static str {
         match self {
-            Self::Scanning => "Scanning folder",
+            Self::Scanning => "Scanning library",
             Self::Indexing => "Indexing videos",
             Self::ClearingIndex => "Clearing index",
             Self::TestingProvider => "Testing connection",
@@ -60,14 +64,8 @@ impl TaskKind {
 }
 
 enum WorkerMessage {
-    CatalogLoaded {
-        folder: PathBuf,
-        videos: Vec<VideoInfo>,
-    },
-    ThumbnailLoaded {
-        path: PathBuf,
-        thumbnail: Thumbnail,
-    },
+    CatalogLoaded { videos: Vec<VideoInfo> },
+    ThumbnailLoaded { path: PathBuf, thumbnail: Thumbnail },
     IndexProgress(IndexProgress),
     CategoriesUpdated(HashMap<String, String>),
     IndexFinished(std::result::Result<IndexOutcome, String>),
@@ -87,6 +85,10 @@ pub struct PastVideoApp {
     app_dir: PathBuf,
     videos: Vec<VideoInfo>,
     textures: HashMap<PathBuf, TextureHandle>,
+    thumbnail_requested: HashSet<PathBuf>,
+    thumbnail_cache_order: VecDeque<PathBuf>,
+    thumbnail_tx: Sender<PathBuf>,
+    folders_expanded: bool,
     selected_video: Option<PathBuf>,
     selected_match: Option<Match>,
     category_filter: Option<String>,
@@ -112,19 +114,27 @@ impl PastVideoApp {
         configure_style(&cc.egui_ctx);
         let app_dir = app_dir();
         let mut preferences = load_preferences(&app_dir);
+        normalize_preference_folders(&mut preferences);
         let e2e_folder = std::env::var("PASTVIDEO_E2E_FOLDER").ok();
         if let Some(folder) = e2e_folder.as_ref() {
-            preferences.last_folder = Some(PathBuf::from(folder));
+            let folder = PathBuf::from(folder);
+            preferences.folders = vec![folder.clone()];
+            preferences.last_folder = Some(folder);
             preferences.embedding.provider = EmbeddingProvider::automatic_local();
         }
         let settings_draft = preferences.embedding.clone();
         let (tx, rx) = mpsc::channel();
+        let thumbnail_tx = start_thumbnail_workers(tx.clone(), cc.egui_ctx.clone());
         let mut app = Self {
             preferences,
             settings_draft,
             app_dir,
             videos: vec![],
             textures: HashMap::new(),
+            thumbnail_requested: HashSet::new(),
+            thumbnail_cache_order: VecDeque::new(),
+            thumbnail_tx,
+            folders_expanded: true,
             selected_video: None,
             selected_match: None,
             category_filter: None,
@@ -144,13 +154,8 @@ impl PastVideoApp {
             tx,
             rx,
         };
-        if let Some(folder) = app
-            .preferences
-            .last_folder
-            .clone()
-            .filter(|path| path.is_dir())
-        {
-            app.start_scan(folder);
+        if !app.preferences.folders.is_empty() {
+            app.start_scan();
         }
         app
     }
@@ -167,52 +172,104 @@ impl PastVideoApp {
         self.data_dir(settings).join("categories.json")
     }
 
-    fn start_scan(&mut self, folder: PathBuf) {
+    fn start_scan(&mut self) {
         self.task = Some(TaskKind::Scanning);
         self.notice = None;
         self.search_results.clear();
         self.searched_query = None;
-        self.textures.clear();
         self.selected_match = None;
-        self.selected_video = None;
         self.index_progress = None;
+        let folders = self.preferences.folders.clone();
         let tx = self.tx.clone();
         let repaint = self.repaint.clone();
         let categories_path = self.categories_path(&self.preferences.embedding);
         thread::spawn(move || {
-            let mut videos = scan_folder(&folder);
+            let mut videos = crate::catalog::scan_folders(&folders);
             apply_categories(&mut videos, &load_categories(&categories_path));
-            let paths: Vec<_> = videos.iter().map(|video| video.path.clone()).collect();
-            if tx
-                .send(WorkerMessage::CatalogLoaded { folder, videos })
-                .is_err()
-            {
-                return;
-            }
+            let _ = tx.send(WorkerMessage::CatalogLoaded { videos });
             repaint.request_repaint();
-            for path in paths {
-                if let Some(thumbnail) = make_thumbnail(&path, 320, 180) {
-                    if tx
-                        .send(WorkerMessage::ThumbnailLoaded { path, thumbnail })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    repaint.request_repaint();
-                }
-            }
         });
     }
 
-    fn choose_folder(&mut self) {
-        let mut dialog = rfd::FileDialog::new().set_title("Choose a video folder");
+    fn add_folder(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("Add a video folder");
         if let Some(folder) = self.preferences.last_folder.as_ref() {
             dialog = dialog.set_directory(folder);
         }
         if let Some(folder) = dialog.pick_folder() {
+            if self
+                .preferences
+                .folders
+                .iter()
+                .any(|existing| paths_equal(existing, &folder))
+            {
+                self.folders_expanded = true;
+                self.notice = Some(("That folder is already in your library.".into(), false));
+                return;
+            }
+            self.preferences.folders.push(folder.clone());
             self.preferences.last_folder = Some(folder.clone());
+            self.folders_expanded = true;
             self.persist();
-            self.start_scan(folder);
+            self.start_scan();
+        }
+    }
+
+    fn remove_folder(&mut self, index: usize) {
+        if self.task.is_some() || self.searching || index >= self.preferences.folders.len() {
+            return;
+        }
+        let removed = self.preferences.folders.remove(index);
+        let before = self.videos.len();
+        self.videos
+            .retain(|video| path_is_in_folders(&video.path, &self.preferences.folders));
+        let removed_videos = before.saturating_sub(self.videos.len());
+        let remaining_paths: HashSet<_> =
+            self.videos.iter().map(|video| video.path.clone()).collect();
+        self.textures
+            .retain(|path, _| remaining_paths.contains(path));
+        self.thumbnail_requested
+            .retain(|path| remaining_paths.contains(path));
+        self.thumbnail_cache_order
+            .retain(|path| remaining_paths.contains(path));
+        if self
+            .selected_video
+            .as_ref()
+            .is_some_and(|path| !remaining_paths.contains(path))
+        {
+            self.selected_video = self.videos.first().map(|video| video.path.clone());
+            self.selected_match = None;
+        }
+        if self.selected_match.as_ref().is_some_and(|item| {
+            !remaining_paths
+                .iter()
+                .any(|path| paths_equal(path, Path::new(&item.source_file)))
+        }) {
+            self.selected_match = None;
+        }
+        self.search_results.retain(|item| {
+            remaining_paths
+                .iter()
+                .any(|path| paths_equal(path, Path::new(&item.source_file)))
+        });
+        self.preferences.last_folder = self.preferences.folders.last().cloned();
+        self.persist();
+        self.notice = Some((
+            format!(
+                "Removed {} and {removed_videos} videos from this library. Source files and saved index data were not changed.",
+                folder_display_name(&removed)
+            ),
+            false,
+        ));
+    }
+
+    fn request_thumbnail(&mut self, path: &Path) {
+        if self.textures.contains_key(path) || self.thumbnail_requested.contains(path) {
+            return;
+        }
+        let path = path.to_path_buf();
+        if self.thumbnail_tx.send(path.clone()).is_ok() {
+            self.thumbnail_requested.insert(path);
         }
     }
 
@@ -230,10 +287,11 @@ impl PastVideoApp {
     }
 
     fn start_index(&mut self) {
-        let Some(folder) = self.preferences.last_folder.clone() else {
-            self.notice = Some(("Choose a folder first.".into(), true));
+        if self.preferences.folders.is_empty() {
+            self.notice = Some(("Add a folder first.".into(), true));
             return;
-        };
+        }
+        let folders = self.preferences.folders.clone();
         let settings = self.preferences.embedding.clone();
         let embedder = match self.get_shared_embedder(&settings) {
             Ok(embedder) => embedder,
@@ -263,8 +321,8 @@ impl PastVideoApp {
                 let mut live_categories = load_categories(&categories_path);
                 let mut last_completed = 0usize;
                 let report = db
-                    .insert_dir_with_progress_and_cancel(
-                        &folder,
+                    .insert_dirs_with_progress_and_cancel(
+                        &folders,
                         |progress| {
                             let completed_file = if progress.files_completed > last_completed {
                                 last_completed = progress.files_completed;
@@ -436,17 +494,46 @@ impl PastVideoApp {
     fn process_messages(&mut self, ctx: &egui::Context) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
-                WorkerMessage::CatalogLoaded { folder, videos } => {
-                    self.preferences.last_folder = Some(folder);
+                WorkerMessage::CatalogLoaded { videos } => {
                     self.videos = videos;
-                    self.selected_video = self.videos.first().map(|video| video.path.clone());
+                    let selected_still_exists = self.selected_video.as_ref().is_some_and(|path| {
+                        self.videos
+                            .iter()
+                            .any(|video| paths_equal(&video.path, path))
+                    });
+                    if !selected_still_exists {
+                        self.selected_video = self.videos.first().map(|video| video.path.clone());
+                    }
+                    let paths: HashSet<_> =
+                        self.videos.iter().map(|video| video.path.clone()).collect();
+                    self.textures.retain(|path, _| paths.contains(path));
+                    self.thumbnail_requested.retain(|path| paths.contains(path));
+                    self.thumbnail_cache_order
+                        .retain(|path| paths.contains(path));
                     self.task = None;
                     self.notice = Some((
-                        format!("Found {} videos. Ready to index.", self.videos.len()),
+                        format!(
+                            "Found {} videos across {} {}. Ready to index.",
+                            self.videos.len(),
+                            self.preferences.folders.len(),
+                            if self.preferences.folders.len() == 1 {
+                                "folder"
+                            } else {
+                                "folders"
+                            }
+                        ),
                         false,
                     ));
                 }
                 WorkerMessage::ThumbnailLoaded { path, thumbnail } => {
+                    if !self
+                        .videos
+                        .iter()
+                        .any(|video| paths_equal(&video.path, &path))
+                    {
+                        self.thumbnail_requested.remove(&path);
+                        continue;
+                    }
                     let image = egui::ColorImage::from_rgb(
                         [thumbnail.width, thumbnail.height],
                         &thumbnail.rgb,
@@ -456,7 +543,15 @@ impl PastVideoApp {
                         image,
                         egui::TextureOptions::LINEAR,
                     );
-                    self.textures.insert(path, texture);
+                    if self.textures.insert(path.clone(), texture).is_none() {
+                        self.thumbnail_cache_order.push_back(path);
+                    }
+                    while self.thumbnail_cache_order.len() > MAX_THUMBNAIL_TEXTURES {
+                        if let Some(expired) = self.thumbnail_cache_order.pop_front() {
+                            self.textures.remove(&expired);
+                            self.thumbnail_requested.remove(&expired);
+                        }
+                    }
                 }
                 WorkerMessage::IndexProgress(progress) => {
                     self.index_progress = Some(progress);
@@ -551,11 +646,8 @@ impl PastVideoApp {
             "Embedding provider saved. Providers keep separate indexes.".into(),
             false,
         ));
-        if let Some(folder) = self.preferences.last_folder.clone() {
-            let categories = load_categories(&self.categories_path(&self.preferences.embedding));
-            apply_categories(&mut self.videos, &categories);
-            self.preferences.last_folder = Some(folder);
-        }
+        let categories = load_categories(&self.categories_path(&self.preferences.embedding));
+        apply_categories(&mut self.videos, &categories);
     }
 
     fn category_counts(&self) -> BTreeMap<String, usize> {
@@ -564,6 +656,13 @@ impl PastVideoApp {
             *counts.entry(video.category.clone()).or_insert(0) += 1;
         }
         counts
+    }
+
+    fn folder_video_count(&self, folder: &Path) -> usize {
+        self.videos
+            .iter()
+            .filter(|video| path_is_in_folder(&video.path, folder))
+            .count()
     }
 
     fn filtered_video_indices(&self) -> Vec<usize> {
@@ -649,34 +748,168 @@ impl PastVideoApp {
             )
             .show(root, |ui| {
                 ui.add_space(8.0);
-                ui.label(RichText::new("LIBRARY").monospace().size(9.0).color(SIGNAL));
-                ui.add_space(12.0);
-                let folder_name = self
-                    .preferences
-                    .last_folder
-                    .as_ref()
-                    .and_then(|path| path.file_name())
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("No folder selected");
-                ui.label(RichText::new(folder_name).size(15.0).strong().color(CREAM));
-                if let Some(folder) = self.preferences.last_folder.as_ref() {
+                ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(folder.display().to_string())
-                            .size(10.0)
-                            .color(MUTED),
+                        RichText::new("LIBRARY")
+                            .monospace()
+                            .size(9.0)
+                            .color(SIGNAL),
                     );
-                }
-                ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} FOLDER{}",
+                                self.preferences.folders.len(),
+                                if self.preferences.folders.len() == 1 {
+                                    ""
+                                } else {
+                                    "S"
+                                }
+                            ))
+                            .monospace()
+                            .size(8.0)
+                            .color(MUTED),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+                let folder_toggle = if self.folders_expanded {
+                    "Hide folders"
+                } else {
+                    "Show folders"
+                };
                 if ui
                     .add_sized(
                         [198.0, 38.0],
-                        egui::Button::new("+  Choose folder").fill(PANEL_RAISED),
+                        egui::Button::new(
+                            RichText::new(format!(
+                                "{folder_toggle}  ·  {} videos",
+                                self.videos.len()
+                            ))
+                            .strong()
+                            .color(CREAM),
+                        )
+                        .fill(PANEL_RAISED),
                     )
                     .clicked()
                 {
-                    self.choose_folder();
+                    self.folders_expanded = !self.folders_expanded;
                 }
-                ui.add_space(28.0);
+                let mut remove_folder = None;
+                if self.folders_expanded {
+                    ui.add_space(6.0);
+                    if self.preferences.folders.is_empty() {
+                        egui::Frame::new()
+                            .fill(INK)
+                            .corner_radius(7)
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("No folders yet")
+                                        .size(11.0)
+                                        .color(MUTED),
+                                );
+                            });
+                    } else {
+                        let folders = self.preferences.folders.clone();
+                        let list_height = (folders.len() as f32 * 62.0).clamp(62.0, 174.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("library_folders")
+                            .max_height(list_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (index, folder) in folders.iter().enumerate() {
+                                    let count = self.folder_video_count(folder);
+                                    egui::Frame::new()
+                                        .fill(INK)
+                                        .stroke(Stroke::new(1.0, LINE))
+                                        .corner_radius(7)
+                                        .inner_margin(egui::Margin::symmetric(9, 7))
+                                        .show(ui, |ui| {
+                                            ui.set_width(178.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(folder_display_name(folder))
+                                                            .size(11.0)
+                                                            .strong()
+                                                            .color(CREAM),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if ui
+                                                            .add_enabled(
+                                                                self.task.is_none()
+                                                                    && !self.searching,
+                                                                egui::Button::new(
+                                                                    RichText::new("Remove")
+                                                                        .size(9.0)
+                                                                        .color(DANGER),
+                                                                )
+                                                                .frame(false),
+                                                            )
+                                                            .on_hover_text(
+                                                                "Remove this folder from the library. Video files are not deleted.",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            remove_folder = Some(index);
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(folder.display().to_string())
+                                                            .size(8.0)
+                                                            .color(MUTED),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.label(
+                                                            RichText::new(format!("{count}"))
+                                                                .monospace()
+                                                                .size(8.0)
+                                                                .color(SIGNAL),
+                                                        );
+                                                    },
+                                                );
+                                            });
+                                        });
+                                    ui.add_space(5.0);
+                                }
+                            });
+                    }
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add_enabled(
+                        self.task.is_none() && !self.searching,
+                        egui::Button::new(
+                            RichText::new("+  Add folder").strong().color(INK),
+                        )
+                        .fill(SIGNAL)
+                        .min_size(Vec2::new(198.0, 36.0)),
+                    )
+                    .clicked()
+                {
+                    self.add_folder();
+                }
+                if let Some(index) = remove_folder {
+                    self.remove_folder(index);
+                }
+                ui.add_space(22.0);
                 ui.label(RichText::new("EXPLORE").monospace().size(9.0).color(MUTED));
                 ui.add_space(8.0);
                 if sidebar_item(
@@ -743,6 +976,7 @@ impl PastVideoApp {
     }
 
     fn show_video_details(&mut self, ui: &mut egui::Ui, path: &Path) {
+        self.request_thumbnail(path);
         if let Some(texture) = self.texture_for_path(path) {
             ui.add(
                 egui::Image::new(texture)
@@ -819,6 +1053,7 @@ impl PastVideoApp {
 
     fn show_match_details(&mut self, ui: &mut egui::Ui, selected_match: &Match) {
         let path = Path::new(&selected_match.source_file);
+        self.request_thumbnail(path);
         if let Some(texture) = self.texture_for_path(path) {
             ui.add(
                 egui::Image::new(texture)
@@ -1025,7 +1260,7 @@ impl PastVideoApp {
                 } else if indexing {
                     "■ Stop indexing"
                 } else if self.videos.is_empty() {
-                    "Index folder"
+                    "Index folders"
                 } else {
                     "Index new videos"
                 };
@@ -1034,7 +1269,7 @@ impl PastVideoApp {
                         if indexing {
                             !stopping
                         } else {
-                            self.task.is_none() && self.preferences.last_folder.is_some()
+                            self.task.is_none() && !self.preferences.folders.is_empty()
                         },
                         egui::Button::new(RichText::new(label).strong().color(if indexing {
                             CREAM
@@ -1065,48 +1300,53 @@ impl PastVideoApp {
         });
         ui.add_space(16.0);
 
-        if self.preferences.last_folder.is_none() {
+        if self.preferences.folders.is_empty() {
             self.show_onboarding(ui);
             return;
         }
         if self.task == Some(TaskKind::Scanning) && self.videos.is_empty() {
-            loading_panel(ui, "Looking through your folder…");
+            loading_panel(ui, "Looking through your folders…");
             return;
         }
         if indices.is_empty() {
             empty_panel(
                 ui,
                 "No videos here",
-                "Choose another category or select a folder containing supported video files.",
+                "Choose another category or add a folder containing supported video files.",
             );
             return;
         }
 
+        let available = ui.available_width();
+        let columns = ((available + 14.0) / 238.0).floor().max(1.0) as usize;
+        let card_width =
+            ((available - 14.0 * (columns.saturating_sub(1)) as f32) / columns as f32).max(170.0);
+        let image_height = (card_width - 18.0) * 9.0 / 16.0;
+        let row_height = image_height + 72.0;
+        let total_rows = indices.len().div_ceil(columns);
         egui::ScrollArea::vertical()
+            .id_salt("video_library")
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let available = ui.available_width();
-                let columns = ((available + 14.0) / 238.0).floor().max(1.0) as usize;
-                let card_width = ((available - 14.0 * (columns.saturating_sub(1)) as f32)
-                    / columns as f32)
-                    .max(170.0);
-                egui::Grid::new("video_grid")
-                    .num_columns(columns)
-                    .spacing(Vec2::new(14.0, 18.0))
-                    .show(ui, |ui| {
-                        for (position, index) in indices.iter().enumerate() {
+            .show_rows(ui, row_height, total_rows, |ui, visible_rows| {
+                for row in visible_rows {
+                    ui.horizontal(|ui| {
+                        ui.set_height(row_height);
+                        ui.spacing_mut().item_spacing.x = 14.0;
+                        for column in 0..columns {
+                            let position = row * columns + column;
+                            let Some(index) = indices.get(position) else {
+                                break;
+                            };
                             let video = self.videos[*index].clone();
                             self.video_card(ui, &video, card_width);
-                            if (position + 1) % columns == 0 {
-                                ui.end_row();
-                            }
                         }
                     });
-                ui.add_space(28.0);
+                }
             });
     }
 
     fn video_card(&mut self, ui: &mut egui::Ui, video: &VideoInfo, width: f32) {
+        self.request_thumbnail(&video.path);
         let selected = self.selected_video.as_ref() == Some(&video.path);
         let frame = egui::Frame::new()
             .fill(if selected {
@@ -1211,7 +1451,7 @@ impl PastVideoApp {
             empty_panel(
                 ui,
                 "No matching moments",
-                "Try a broader description or index this folder first.",
+                "Try a broader description or index your library first.",
             );
         } else {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1311,19 +1551,19 @@ impl PastVideoApp {
                     ui.add_space(12.0);
                     ui.label(RichText::new("Bring your videos back into view").size(24.0).strong().color(CREAM));
                     ui.add_space(7.0);
-                    ui.label(RichText::new("Choose a folder. PastVideo finds every video beneath it and builds a searchable local index.").size(12.0).color(MUTED));
+                    ui.label(RichText::new("Add one or more folders. PastVideo combines their videos into one searchable library.").size(12.0).color(MUTED));
                     ui.add_space(22.0);
                     if ui
                         .add_sized(
                             [190.0, 42.0],
                             egui::Button::new(
-                                RichText::new("Choose a folder").strong().color(INK),
+                                RichText::new("Add a folder").strong().color(INK),
                             )
                             .fill(SIGNAL),
                         )
                         .clicked()
                     {
-                        self.choose_folder();
+                        self.add_folder();
                     }
                 });
             });
@@ -1469,7 +1709,7 @@ impl PastVideoApp {
                 );
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("Source videos are never deleted. You can run Index folder again afterward.")
+                    RichText::new("Source videos are never deleted. You can index the library again afterward.")
                         .size(11.0)
                         .color(MUTED),
                 );
@@ -1845,6 +2085,76 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
     }
 }
 
+fn path_is_in_folder(path: &Path, folder: &Path) -> bool {
+    if path.starts_with(folder) {
+        return true;
+    }
+    match (path.canonicalize(), folder.canonicalize()) {
+        (Ok(path), Ok(folder)) => path.starts_with(folder),
+        _ => false,
+    }
+}
+
+fn path_is_in_folders(path: &Path, folders: &[PathBuf]) -> bool {
+    folders.iter().any(|folder| path_is_in_folder(path, folder))
+}
+
+fn folder_display_name(folder: &Path) -> String {
+    folder
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| folder.display().to_string())
+}
+
+fn normalize_preference_folders(preferences: &mut Preferences) {
+    if preferences.folders.is_empty() {
+        if let Some(folder) = preferences.last_folder.clone() {
+            preferences.folders.push(folder);
+        }
+    }
+    let mut seen = HashSet::new();
+    preferences.folders.retain(|folder| {
+        let key = folder.canonicalize().unwrap_or_else(|_| folder.clone());
+        seen.insert(key)
+    });
+    preferences.last_folder = preferences.folders.last().cloned();
+}
+
+fn start_thumbnail_workers(
+    output: Sender<WorkerMessage>,
+    repaint: egui::Context,
+) -> Sender<PathBuf> {
+    let (requests, receiver) = mpsc::channel::<PathBuf>();
+    let receiver = Arc::new(Mutex::new(receiver));
+    for _ in 0..2 {
+        let receiver = Arc::clone(&receiver);
+        let output = output.clone();
+        let repaint = repaint.clone();
+        thread::spawn(move || loop {
+            let path = match receiver.lock() {
+                Ok(receiver) => match receiver.recv() {
+                    Ok(path) => path,
+                    Err(_) => break,
+                },
+                Err(_) => break,
+            };
+            let Some(thumbnail) = make_thumbnail(&path, 320, 180) else {
+                continue;
+            };
+            if output
+                .send(WorkerMessage::ThumbnailLoaded { path, thumbnail })
+                .is_err()
+            {
+                break;
+            }
+            repaint.request_repaint();
+        });
+    }
+    requests
+}
+
 fn app_dir() -> PathBuf {
     dirs::data_local_dir()
         .or_else(dirs::data_dir)
@@ -1876,6 +2186,58 @@ mod tests {
         preferences.embedding.gemini_api_key = "top-secret".into();
         let json = serde_json::to_string(&preferences).unwrap();
         assert!(!json.contains("top-secret"));
+    }
+
+    #[test]
+    fn legacy_single_folder_preferences_migrate_to_library_folders() {
+        let legacy = tempfile::tempdir().unwrap();
+        let legacy_folder = legacy.path().join("videos");
+        fs::create_dir_all(&legacy_folder).unwrap();
+        let mut preferences: Preferences = serde_json::from_value(serde_json::json!({
+            "last_folder": legacy_folder,
+        }))
+        .unwrap();
+
+        normalize_preference_folders(&mut preferences);
+
+        assert_eq!(preferences.folders.len(), 1);
+        assert!(paths_equal(
+            &preferences.folders[0],
+            preferences.last_folder.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn preference_folder_normalization_deduplicates_equivalent_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let mut preferences = Preferences {
+            folders: vec![root.path().to_path_buf(), root.path().join(".")],
+            ..Preferences::default()
+        };
+
+        normalize_preference_folders(&mut preferences);
+
+        assert_eq!(preferences.folders.len(), 1);
+        assert!(paths_equal(
+            preferences.last_folder.as_ref().unwrap(),
+            root.path()
+        ));
+    }
+
+    #[test]
+    fn overlapping_folder_membership_keeps_videos_owned_by_a_remaining_root() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let nested_video = nested.join("clip.mp4");
+        fs::write(&nested_video, []).unwrap();
+
+        assert!(path_is_in_folders(
+            &nested_video,
+            &[root.path().to_path_buf(), nested.clone()]
+        ));
+        assert!(path_is_in_folders(&nested_video, &[nested]));
+        assert!(!path_is_in_folders(&nested_video, &[]));
     }
 
     #[test]

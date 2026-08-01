@@ -251,6 +251,37 @@ impl Database {
         self.insert_paths(videos, &mut on_progress, &should_cancel)
     }
 
+    /// Recursively index several library roots as one deduplicated run. This
+    /// lets short videos from different folders share GPU batches while the
+    /// progress totals describe the combined library.
+    pub fn insert_dirs_with_progress_and_cancel<F, C>(
+        &self,
+        dirs: &[PathBuf],
+        mut on_progress: F,
+        should_cancel: C,
+    ) -> Result<IndexReport>
+    where
+        F: FnMut(IndexProgress),
+        C: Fn() -> bool,
+    {
+        let mut seen = HashSet::new();
+        let mut videos = Vec::new();
+        for dir in dirs {
+            for path in scan_directory(dir) {
+                let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if seen.insert(key) {
+                    videos.push(path);
+                }
+            }
+        }
+        videos.sort_by(|left, right| {
+            left.to_string_lossy()
+                .to_lowercase()
+                .cmp(&right.to_string_lossy().to_lowercase())
+        });
+        self.insert_paths(videos, &mut on_progress, &should_cancel)
+    }
+
     fn insert_paths(
         &self,
         videos: Vec<PathBuf>,
