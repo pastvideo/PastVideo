@@ -12,17 +12,19 @@ language, then play the matching video or exact interval.
 ```
 
 PastVideo starts as a real native desktop window; it does not require or open a
-browser. Gemini Embedding 2 is the default provider. Add `GEMINI_API_KEY` in the
-environment or open **Settings** and enter a key for the current session.
+browser. It defaults to private local indexing: Qwen3-VL on the local CUDA GPU
+when its runtime and model are available, otherwise the built-in CPU backend.
+Gemini remains available by setting `GEMINI_API_KEY` or entering a key in
+**Settings** for the current session.
 
 Provider choices in Settings:
 
-- **Gemini** (default): `gemini-embedding-2`, a managed multimodal embedding API.
+- **Local GPU** (automatic default when available): the existing Qwen3-VL worker.
+- **Local CPU** (automatic fallback): a lightweight offline baseline for testing
+  and simple visual searches.
+- **Gemini**: `gemini-embedding-2`, a managed multimodal embedding API.
 - **Remote service**: a configurable HTTP endpoint, useful for another GPU on
   this machine or the local network.
-- **Local GPU**: the existing Qwen3-VL worker.
-- **Local CPU**: a lightweight offline baseline for testing and simple visual
-  searches.
 
 Indexes are isolated by provider/model so incompatible vectors never mix. API
 keys are held in memory and are not written to the preferences file. Supported

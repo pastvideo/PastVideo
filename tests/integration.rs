@@ -4,27 +4,17 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
-use pastvideo::{default_embedder, Config, Database, HighlightMethod};
+use pastvideo::{default_embedder, Config, Database, HighlightMethod, VideoSpan};
 
 fn ffmpeg_available() -> bool {
-    which("ffmpeg").is_some()
-}
-
-fn which(prog: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(prog);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    pastvideo::chunker::find_ffmpeg().is_ok()
 }
 
 fn make_color_video(path: &Path, color: &str, secs: u32) {
     let src = format!("color=c={color}:s=64x48:d={secs}");
-    let status = Command::new("ffmpeg")
+    let status = Command::new(pastvideo::chunker::find_ffmpeg().expect("ffmpeg path"))
         .args(["-y", "-f", "lavfi", "-i", &src, "-pix_fmt", "yuv420p"])
         .arg(path)
         .status()
@@ -34,7 +24,7 @@ fn make_color_video(path: &Path, color: &str, secs: u32) {
 
 fn make_color_image(path: &Path, color: &str) {
     let src = format!("color=c={color}:s=64x48:d=1");
-    let status = Command::new("ffmpeg")
+    let status = Command::new(pastvideo::chunker::find_ffmpeg().expect("ffmpeg path"))
         .args([
             "-y",
             "-f",
@@ -207,4 +197,78 @@ fn backend_mismatch_is_rejected() {
         "a mismatched backend must be rejected, got: {:?}",
         result.map(|_| ())
     );
+}
+
+#[test]
+fn direct_span_backend_batches_and_reports_live_progress() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+
+    struct SpanBackend {
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl pastvideo::Embedder for SpanBackend {
+        fn embed_video_chunk(&self, _: &Path) -> pastvideo::Result<Vec<f32>> {
+            panic!("direct span backend must not receive temporary clips")
+        }
+        fn embed_video_chunks(&self, _: &[PathBuf]) -> pastvideo::Result<Vec<Vec<f32>>> {
+            panic!("direct span backend must not receive temporary clip batches")
+        }
+        fn video_batch_size(&self) -> usize {
+            2
+        }
+        fn supports_video_spans(&self) -> bool {
+            true
+        }
+        fn embed_video_spans(&self, spans: &[VideoSpan]) -> pastvideo::Result<Vec<Vec<f32>>> {
+            self.batch_sizes.lock().unwrap().push(spans.len());
+            Ok(spans.iter().map(|_| vec![1.0]).collect())
+        }
+        fn embed_text(&self, _: &str) -> pastvideo::Result<Vec<f32>> {
+            Ok(vec![1.0])
+        }
+        fn embed_image(&self, _: &Path) -> pastvideo::Result<Vec<f32>> {
+            Ok(vec![1.0])
+        }
+        fn dimensions(&self) -> usize {
+            1
+        }
+        fn backend(&self) -> &str {
+            "span-test"
+        }
+        fn model(&self) -> &str {
+            "span-test-v1"
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let video = tmp.path().join("long.mp4");
+    make_color_video(&video, "blue", 70);
+    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let backend = SpanBackend {
+        batch_sizes: Arc::clone(&batch_sizes),
+    };
+    let config = Config {
+        chunk_duration: 30.0,
+        overlap: 5.0,
+        skip_still: false,
+        ..Config::default()
+    };
+    let db = Database::with_config(tmp.path().join("db"), Box::new(backend), config).unwrap();
+    let mut progress = Vec::new();
+    let report = db
+        .insert_dir_with_progress(tmp.path(), |update| progress.push(update))
+        .unwrap();
+
+    assert_eq!(report.new_chunks, 3);
+    assert_eq!(*batch_sizes.lock().unwrap(), vec![2, 1]);
+    let last = progress.last().expect("a final progress update");
+    assert_eq!(last.files_completed, 1);
+    assert_eq!(last.files_total, 1);
+    assert_eq!(last.chunks_completed, 3);
+    assert_eq!(last.chunks_total, 3);
+    assert_eq!(last.new_chunks, 3);
 }

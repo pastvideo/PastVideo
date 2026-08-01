@@ -4,6 +4,8 @@
 # Local Qwen/Python and media tool runtimes
 /.venv-qwen/
 /.tools/
+__pycache__/
+*.pyc
 
 # SQLite runtime databases
 *.db

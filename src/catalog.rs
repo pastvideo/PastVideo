@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 use crate::chunker::{extract_frames, scan_directory, video_duration};
 use crate::{Database, Result};
 
-pub const CATEGORY_DEFINITIONS: [(&str, &str); 8] = [
+pub const CATEGORY_DEFINITIONS: [(&str, &str); 9] = [
+    (
+        "Entertainment",
+        "movies, television, animation, anime, music, performances, games and fictional stories",
+    ),
     (
         "People",
         "people, family, friends, portraits, celebrations and gatherings",
@@ -117,19 +121,44 @@ pub fn make_thumbnail(path: &Path, width: usize, height: usize) -> Option<Thumbn
 /// Assign categories by comparing every indexed moment to semantic category
 /// descriptions. The maximum-scoring moment represents each source video.
 pub fn semantic_categories(db: &Database) -> Result<HashMap<String, String>> {
+    let embeddings = build_category_embeddings(db)?;
+    semantic_categories_with_embeddings(db, &embeddings)
+}
+
+pub type CategoryEmbeddings = Vec<(&'static str, Vec<f32>)>;
+
+/// Embed the taxonomy once so live per-file categorization does not repeatedly
+/// invoke the model while the rest of the folder is still indexing.
+pub fn build_category_embeddings(db: &Database) -> Result<CategoryEmbeddings> {
+    let descriptions: Vec<String> = CATEGORY_DEFINITIONS
+        .iter()
+        .map(|(_, description)| (*description).to_owned())
+        .collect();
+    let embeddings = db.embed_texts(&descriptions)?;
+    Ok(CATEGORY_DEFINITIONS
+        .iter()
+        .zip(embeddings)
+        .map(|((category, _), embedding)| (*category, embedding))
+        .collect())
+}
+
+pub fn semantic_categories_with_embeddings(
+    db: &Database,
+    embeddings: &CategoryEmbeddings,
+) -> Result<HashMap<String, String>> {
     let stats = db.stats()?;
     if stats.total_chunks == 0 {
         return Ok(HashMap::new());
     }
     let result_limit = (stats.total_chunks as usize).min(20_000);
     let mut best: HashMap<String, (&'static str, f64)> = HashMap::new();
-    for (category, description) in CATEGORY_DEFINITIONS {
-        for hit in db.search_text(description, result_limit, None)? {
+    for (category, embedding) in embeddings {
+        for hit in db.search_vector(embedding, result_limit)? {
             let entry = best
                 .entry(hit.source_file)
-                .or_insert((category, f64::NEG_INFINITY));
+                .or_insert((*category, f64::NEG_INFINITY));
             if hit.score > entry.1 {
-                *entry = (category, hit.score);
+                *entry = (*category, hit.score);
             }
         }
     }
@@ -137,6 +166,30 @@ pub fn semantic_categories(db: &Database) -> Result<HashMap<String, String>> {
         .into_iter()
         .map(|(path, (category, _))| (path, category.to_string()))
         .collect())
+}
+
+pub fn semantic_category_for_source(
+    db: &Database,
+    source_file: &str,
+    embeddings: &CategoryEmbeddings,
+) -> Result<Option<String>> {
+    let stats = db.stats()?;
+    let result_limit = (stats.total_chunks as usize).min(20_000);
+    let mut best: Option<(&str, f64)> = None;
+    for (category, embedding) in embeddings {
+        let score = db
+            .search_vector(embedding, result_limit)?
+            .into_iter()
+            .filter(|hit| hit.source_file == source_file)
+            .map(|hit| hit.score)
+            .max_by(|left, right| left.total_cmp(right));
+        if let Some(score) = score {
+            if best.is_none_or(|(_, best_score)| score > best_score) {
+                best = Some((category, score));
+            }
+        }
+    }
+    Ok(best.map(|(category, _)| category.to_owned()))
 }
 
 pub fn apply_categories(videos: &mut [VideoInfo], categories: &HashMap<String, String>) {
@@ -147,12 +200,10 @@ pub fn apply_categories(videos: &mut [VideoInfo], categories: &HashMap<String, S
             .unwrap_or_else(|_| video.path.clone())
             .to_string_lossy()
             .to_string();
-        if video.category == "Unsorted" {
-            let Some(category) = categories.get(&canonical) else {
-                continue;
-            };
-            video.category.clone_from(category);
-        }
+        let Some(category) = categories.get(&canonical) else {
+            continue;
+        };
+        video.category.clone_from(category);
     }
 }
 
@@ -178,7 +229,19 @@ pub fn load_categories(path: &Path) -> HashMap<String, String> {
 
 pub fn infer_category(path: &Path) -> &'static str {
     let searchable = path.to_string_lossy().to_ascii_lowercase();
-    let groups: [(&str, &[&str]); 8] = [
+    let groups: [(&str, &[&str]); 9] = [
+        (
+            "Entertainment",
+            &[
+                "movie",
+                "film",
+                "anime",
+                "animation",
+                "concert",
+                "music",
+                "episode",
+            ],
+        ),
         (
             "People",
             &[

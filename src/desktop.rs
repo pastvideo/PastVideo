@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -14,12 +15,13 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use crate::catalog::CATEGORY_DEFINITIONS;
 use crate::catalog::{
-    apply_categories, format_duration, load_categories, make_thumbnail, save_categories,
-    scan_folder, semantic_categories, Thumbnail, VideoInfo,
+    apply_categories, build_category_embeddings, format_duration, load_categories, make_thumbnail,
+    save_categories, scan_folder, semantic_categories, semantic_categories_with_embeddings,
+    semantic_category_for_source, Thumbnail, VideoInfo,
 };
 use crate::chunker::find_ffmpeg;
 use crate::provider::{create_embedder, EmbeddingProvider, EmbeddingSettings};
-use crate::{Config, Database, IndexReport, Match};
+use crate::{Config, Database, IndexProgress, IndexReport, Match};
 
 const INK: Color32 = Color32::from_rgb(13, 15, 15);
 const PANEL: Color32 = Color32::from_rgb(20, 23, 22);
@@ -65,6 +67,8 @@ enum WorkerMessage {
         path: PathBuf,
         thumbnail: Thumbnail,
     },
+    IndexProgress(IndexProgress),
+    CategoriesUpdated(HashMap<String, String>),
     IndexFinished(std::result::Result<IndexOutcome, String>),
     SearchFinished(std::result::Result<Vec<Match>, String>),
     ProviderTestFinished(std::result::Result<String, String>),
@@ -88,6 +92,7 @@ pub struct PastVideoApp {
     searched_query: Option<String>,
     search_results: Vec<Match>,
     task: Option<TaskKind>,
+    index_progress: Option<IndexProgress>,
     notice: Option<(String, bool)>,
     settings_open: bool,
     persist_preferences: bool,
@@ -104,7 +109,7 @@ impl PastVideoApp {
         let e2e_folder = std::env::var("PASTVIDEO_E2E_FOLDER").ok();
         if let Some(folder) = e2e_folder.as_ref() {
             preferences.last_folder = Some(PathBuf::from(folder));
-            preferences.embedding.provider = EmbeddingProvider::LocalCpu;
+            preferences.embedding.provider = EmbeddingProvider::automatic_local();
         }
         let settings_draft = preferences.embedding.clone();
         let (tx, rx) = mpsc::channel();
@@ -121,6 +126,7 @@ impl PastVideoApp {
             searched_query: None,
             search_results: vec![],
             task: None,
+            index_progress: None,
             notice: None,
             settings_open: false,
             persist_preferences: e2e_folder.is_none(),
@@ -159,6 +165,7 @@ impl PastVideoApp {
         self.textures.clear();
         self.selected_match = None;
         self.selected_video = None;
+        self.index_progress = None;
         let tx = self.tx.clone();
         let repaint = self.repaint.clone();
         let categories_path = self.categories_path(&self.preferences.embedding);
@@ -208,7 +215,9 @@ impl PastVideoApp {
         let data_dir = self.data_dir(&settings);
         let categories_path = self.categories_path(&settings);
         let tx = self.tx.clone();
+        let repaint = self.repaint.clone();
         self.task = Some(TaskKind::Indexing);
+        self.index_progress = None;
         self.notice = None;
         thread::spawn(move || {
             let result = (|| -> std::result::Result<IndexOutcome, String> {
@@ -219,9 +228,47 @@ impl PastVideoApp {
                 };
                 let db = Database::with_config(&data_dir, embedder, config)
                     .map_err(|error| error.to_string())?;
-                let report = db.insert_dir(&folder).map_err(|error| error.to_string())?;
+                let category_embeddings = build_category_embeddings(&db).unwrap_or_default();
+                let mut live_categories = load_categories(&categories_path);
+                let mut last_completed = 0usize;
+                let report = db
+                    .insert_dir_with_progress(&folder, |progress| {
+                        let completed_file = if progress.files_completed > last_completed {
+                            last_completed = progress.files_completed;
+                            Some(progress.current_file.clone())
+                        } else {
+                            None
+                        };
+                        let _ = tx.send(WorkerMessage::IndexProgress(progress));
+                        repaint.request_repaint();
+                        if let Some(file) = completed_file {
+                            let canonical = file
+                                .canonicalize()
+                                .unwrap_or(file)
+                                .to_string_lossy()
+                                .to_string();
+                            if let Ok(Some(category)) =
+                                semantic_category_for_source(&db, &canonical, &category_embeddings)
+                            {
+                                live_categories.insert(canonical, category);
+                                let _ = save_categories(&categories_path, &live_categories);
+                                let _ = tx.send(WorkerMessage::CategoriesUpdated(
+                                    live_categories.clone(),
+                                ));
+                                repaint.request_repaint();
+                            }
+                        }
+                    })
+                    .map_err(|error| error.to_string())?;
                 let categories = if report.new_chunks > 0 || !categories_path.is_file() {
-                    let categories = semantic_categories(&db).unwrap_or_default();
+                    let semantic = if category_embeddings.is_empty() {
+                        semantic_categories(&db).unwrap_or_default()
+                    } else {
+                        semantic_categories_with_embeddings(&db, &category_embeddings)
+                            .unwrap_or_default()
+                    };
+                    let mut categories = live_categories;
+                    categories.extend(semantic);
                     let _ = save_categories(&categories_path, &categories);
                     categories
                 } else {
@@ -312,8 +359,15 @@ impl PastVideoApp {
                     );
                     self.textures.insert(path, texture);
                 }
+                WorkerMessage::IndexProgress(progress) => {
+                    self.index_progress = Some(progress);
+                }
+                WorkerMessage::CategoriesUpdated(categories) => {
+                    apply_categories(&mut self.videos, &categories);
+                }
                 WorkerMessage::IndexFinished(result) => {
                     self.task = None;
+                    self.index_progress = None;
                     match result {
                         Ok(outcome) => {
                             apply_categories(&mut self.videos, &outcome.categories);
@@ -749,6 +803,58 @@ impl PastVideoApp {
                     }
                 });
             });
+    }
+
+    fn show_index_progress(&self, ui: &mut egui::Ui) {
+        let Some(progress) = self.index_progress.as_ref() else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new("Preparing local index…")
+                        .size(11.0)
+                        .color(SIGNAL),
+                );
+            });
+            return;
+        };
+
+        let fraction = if progress.chunks_total == 0 {
+            0.0
+        } else {
+            progress.chunks_completed as f32 / progress.chunks_total as f32
+        };
+        let file_name = progress
+            .current_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Video");
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "INDEXING  ·  {}/{} VIDEOS  ·  {}/{} MOMENTS",
+                    progress.files_completed,
+                    progress.files_total,
+                    progress.chunks_completed,
+                    progress.chunks_total
+                ))
+                .monospace()
+                .size(10.0)
+                .strong()
+                .color(SIGNAL),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("{} new", progress.new_chunks))
+                        .size(10.0)
+                        .color(MUTED),
+                );
+            });
+        });
+        ui.add(
+            egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                .desired_width(ui.available_width())
+                .text(file_name),
+        );
     }
 
     fn show_library(&mut self, ui: &mut egui::Ui) {
@@ -1192,14 +1298,18 @@ impl eframe::App for PastVideoApp {
                 ui.add_space(24.0);
                 if let Some(task) = self.task {
                     if task != TaskKind::Scanning && task != TaskKind::Searching {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(
-                                RichText::new(format!("{}…", task.label()))
-                                    .size(11.0)
-                                    .color(SIGNAL),
-                            );
-                        });
+                        if task == TaskKind::Indexing {
+                            self.show_index_progress(ui);
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    RichText::new(format!("{}…", task.label()))
+                                        .size(11.0)
+                                        .color(SIGNAL),
+                                );
+                            });
+                        }
                         ui.add_space(12.0);
                     }
                 }
@@ -1261,6 +1371,7 @@ fn app_icon() -> egui::IconData {
 }
 
 fn configure_style(ctx: &egui::Context) {
+    install_multilingual_font(ctx);
     ctx.set_theme(egui::Theme::Dark);
     ctx.enable_accesskit();
     let mut visuals = egui::Visuals::dark();
@@ -1284,6 +1395,50 @@ fn configure_style(ctx: &egui::Context) {
     style.spacing.button_padding = Vec2::new(12.0, 8.0);
     style.visuals.window_corner_radius = 12.into();
     ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+/// Add an OS-provided CJK font as a fallback while preserving egui's compact
+/// Latin fonts. Video libraries often contain multilingual folder and file
+/// names, so showing replacement squares is not an acceptable fallback.
+fn install_multilingual_font(ctx: &egui::Context) {
+    let mut candidates = Vec::new();
+
+    if let Some(windows_dir) = std::env::var_os("WINDIR") {
+        let fonts_dir = PathBuf::from(windows_dir).join("Fonts");
+        candidates.extend(
+            ["msyh.ttc", "msyhl.ttc", "simhei.ttf", "simsun.ttc"]
+                .into_iter()
+                .map(|font| fonts_dir.join(font)),
+        );
+    }
+
+    candidates.extend(
+        [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+
+    let Some(font_bytes) = candidates.into_iter().find_map(|path| fs::read(path).ok()) else {
+        return;
+    };
+
+    let font_name = "pastvideo-multilingual".to_owned();
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        font_name.clone(),
+        Arc::new(egui::FontData::from_owned(font_bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(fallbacks) = fonts.families.get_mut(&family) {
+            fallbacks.push(font_name.clone());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 fn sidebar_item(ui: &mut egui::Ui, label: &str, count: usize, selected: bool) -> bool {

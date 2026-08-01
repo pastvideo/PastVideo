@@ -1,5 +1,6 @@
 //! User-facing embedding provider configuration and factory.
 
+use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::embedder::baseline::BaselineEmbedder;
 use crate::embedder::gemini::{GeminiConfig, GeminiEmbedder};
-use crate::embedder::qwen::QwenEmbedder;
+use crate::embedder::qwen::{QwenConfig, QwenEmbedder};
 use crate::embedder::remote::{RemoteConfig, RemoteEmbedder};
 use crate::{Embedder, Error, Result};
 
@@ -21,13 +22,23 @@ pub enum EmbeddingProvider {
 }
 
 impl EmbeddingProvider {
-    pub const ALL: [Self; 4] = [Self::Gemini, Self::Remote, Self::LocalGpu, Self::LocalCpu];
+    pub const ALL: [Self; 4] = [Self::LocalGpu, Self::LocalCpu, Self::Gemini, Self::Remote];
+
+    /// Prefer the private local CUDA backend when its runtime and model are
+    /// available, otherwise use the dependency-free local CPU backend.
+    pub fn automatic_local() -> Self {
+        if QwenConfig::from_env().is_ok() && cuda_gpu_available() {
+            Self::LocalGpu
+        } else {
+            Self::LocalCpu
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Gemini => "Gemini (recommended)",
+            Self::Gemini => "Gemini",
             Self::Remote => "Remote service",
-            Self::LocalGpu => "Local GPU · Qwen3-VL",
+            Self::LocalGpu => "Local GPU · Qwen3-VL (recommended)",
             Self::LocalCpu => "Local CPU · basic",
         }
     }
@@ -60,7 +71,7 @@ pub struct EmbeddingSettings {
 impl Default for EmbeddingSettings {
     fn default() -> Self {
         Self {
-            provider: EmbeddingProvider::Gemini,
+            provider: EmbeddingProvider::automatic_local(),
             gemini_model: "gemini-embedding-2".into(),
             gemini_dimensions: 768,
             remote_endpoint: "http://127.0.0.1:8080/embed".into(),
@@ -70,6 +81,13 @@ impl Default for EmbeddingSettings {
             remote_api_key: String::new(),
         }
     }
+}
+
+fn cuda_gpu_available() -> bool {
+    Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
 }
 
 impl EmbeddingSettings {
@@ -152,12 +170,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_gemini_and_secrets_do_not_serialize() {
+    fn default_is_local_and_secrets_do_not_serialize() {
         let settings = EmbeddingSettings {
             gemini_api_key: "secret".into(),
             ..EmbeddingSettings::default()
         };
-        assert_eq!(settings.provider, EmbeddingProvider::Gemini);
+        assert!(matches!(
+            settings.provider,
+            EmbeddingProvider::LocalGpu | EmbeddingProvider::LocalCpu
+        ));
         let json = serde_json::to_string(&settings).unwrap();
         assert!(!json.contains("secret"));
     }

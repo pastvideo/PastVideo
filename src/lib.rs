@@ -43,12 +43,12 @@ pub mod trimmer;
 
 mod db;
 
-pub use db::{Config, Database, IndexReport, Match};
+pub use db::{Config, Database, IndexProgress, IndexReport, Match};
 pub use dlq::{DeadLetterQueue, DlqEntry};
 pub use embedder::gemini::{GeminiConfig, GeminiEmbedder};
 pub use embedder::qwen::{QwenConfig, QwenEmbedder};
 pub use embedder::remote::{RemoteConfig, RemoteEmbedder};
-pub use embedder::{default_embedder, qwen_embedder, Embedder};
+pub use embedder::{default_embedder, qwen_embedder, Embedder, VideoSpan};
 pub use error::{Error, Result};
 pub use highlights::{AgainstMode, Anomaly, Method as HighlightMethod};
 pub use provider::{create_embedder, EmbeddingProvider, EmbeddingSettings};

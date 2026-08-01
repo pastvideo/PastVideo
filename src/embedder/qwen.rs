@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-use crate::embedder::Embedder;
+use crate::embedder::{Embedder, VideoSpan};
 use crate::error::{Error, Result};
 
 pub const BACKEND: &str = "qwen3-vl";
@@ -21,6 +21,7 @@ pub struct QwenConfig {
     pub model_path: PathBuf,
     pub worker_script: PathBuf,
     pub max_frames: usize,
+    pub batch_size: usize,
 }
 
 impl QwenConfig {
@@ -52,6 +53,11 @@ impl QwenConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(16);
+        let batch_size = env::var("PASTVIDEO_QWEN_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(automatic_batch_size)
+            .clamp(1, 8);
 
         for (label, path) in [
             ("Qwen Python runtime", &python),
@@ -71,6 +77,7 @@ impl QwenConfig {
             model_path,
             worker_script,
             max_frames,
+            batch_size,
         })
     }
 }
@@ -151,6 +158,79 @@ impl Worker {
         Ok(embedding)
     }
 
+    fn request_batch(&mut self, paths: &[PathBuf]) -> Result<Vec<Vec<f32>>> {
+        serde_json::to_writer(
+            &mut self.input,
+            &json!({"op": "video_batch", "paths": paths}),
+        )
+        .map_err(|error| Error::Embed(format!("could not encode Qwen batch request: {error}")))?;
+        self.input.write_all(b"\n")?;
+        self.input.flush()?;
+        let response = self.read_response()?;
+        if !response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let message = response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown worker error");
+            return Err(Error::Embed(message.to_owned()));
+        }
+        let embeddings = response
+            .get("embeddings")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Embed("Qwen worker returned no batch embeddings".into()))?;
+        embeddings
+            .iter()
+            .map(|values| {
+                let values = values
+                    .as_array()
+                    .ok_or_else(|| Error::Embed("Qwen returned an invalid batch vector".into()))?;
+                let embedding: Vec<f32> = values
+                    .iter()
+                    .map(|value| value.as_f64().unwrap_or(0.0) as f32)
+                    .collect();
+                if embedding.len() != DIMENSIONS {
+                    return Err(Error::Embed(format!(
+                        "Qwen returned {} dimensions; expected {DIMENSIONS}",
+                        embedding.len()
+                    )));
+                }
+                Ok(embedding)
+            })
+            .collect()
+    }
+
+    fn request_spans(&mut self, spans: &[VideoSpan]) -> Result<Vec<Vec<f32>>> {
+        let spans: Vec<_> = spans
+            .iter()
+            .map(|span| {
+                json!({
+                    "path": span.path,
+                    "start_time": span.start_time,
+                    "end_time": span.end_time,
+                })
+            })
+            .collect();
+        serde_json::to_writer(
+            &mut self.input,
+            &json!({"op": "video_span_batch", "spans": spans}),
+        )
+        .map_err(|error| Error::Embed(format!("could not encode Qwen span request: {error}")))?;
+        self.input.write_all(b"\n")?;
+        self.input.flush()?;
+        parse_batch_response(self.read_response()?)
+    }
+
+    fn request_texts(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        serde_json::to_writer(
+            &mut self.input,
+            &json!({"op": "text_batch", "texts": texts}),
+        )
+        .map_err(|error| Error::Embed(format!("could not encode Qwen text batch: {error}")))?;
+        self.input.write_all(b"\n")?;
+        self.input.flush()?;
+        parse_batch_response(self.read_response()?)
+    }
+
     fn read_response(&mut self) -> Result<Value> {
         let mut line = String::new();
         if self.output.read_line(&mut line)? == 0 {
@@ -201,6 +281,48 @@ impl QwenEmbedder {
             .expect("Qwen worker was initialized")
             .request(request)
     }
+
+    fn request_batch(&self, paths: &[PathBuf]) -> Result<Vec<Vec<f32>>> {
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| Error::Embed("Qwen worker lock was poisoned".into()))?;
+        if worker.is_none() {
+            *worker = Some(Worker::start(&self.config)?);
+        }
+        worker
+            .as_mut()
+            .expect("Qwen worker was initialized")
+            .request_batch(paths)
+    }
+
+    fn request_spans(&self, spans: &[VideoSpan]) -> Result<Vec<Vec<f32>>> {
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| Error::Embed("Qwen worker lock was poisoned".into()))?;
+        if worker.is_none() {
+            *worker = Some(Worker::start(&self.config)?);
+        }
+        worker
+            .as_mut()
+            .expect("Qwen worker was initialized")
+            .request_spans(spans)
+    }
+
+    fn request_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| Error::Embed("Qwen worker lock was poisoned".into()))?;
+        if worker.is_none() {
+            *worker = Some(Worker::start(&self.config)?);
+        }
+        worker
+            .as_mut()
+            .expect("Qwen worker was initialized")
+            .request_texts(texts)
+    }
 }
 
 impl Embedder for QwenEmbedder {
@@ -208,8 +330,28 @@ impl Embedder for QwenEmbedder {
         self.request(json!({"op": "video", "path": chunk_path}))
     }
 
+    fn embed_video_chunks(&self, chunk_paths: &[PathBuf]) -> Result<Vec<Vec<f32>>> {
+        self.request_batch(chunk_paths)
+    }
+
+    fn video_batch_size(&self) -> usize {
+        self.config.batch_size
+    }
+
+    fn supports_video_spans(&self) -> bool {
+        true
+    }
+
+    fn embed_video_spans(&self, spans: &[VideoSpan]) -> Result<Vec<Vec<f32>>> {
+        self.request_spans(spans)
+    }
+
     fn embed_text(&self, query: &str) -> Result<Vec<f32>> {
         self.request(json!({"op": "text", "text": query}))
+    }
+
+    fn embed_texts(&self, queries: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.request_texts(queries)
     }
 
     fn embed_image(&self, image_path: &Path) -> Result<Vec<f32>> {
@@ -229,9 +371,57 @@ impl Embedder for QwenEmbedder {
     }
 }
 
+fn parse_batch_response(response: Value) -> Result<Vec<Vec<f32>>> {
+    if !response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let message = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown worker error");
+        return Err(Error::Embed(message.to_owned()));
+    }
+    let embeddings = response
+        .get("embeddings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Embed("Qwen worker returned no batch embeddings".into()))?;
+    embeddings
+        .iter()
+        .map(|values| {
+            let values = values
+                .as_array()
+                .ok_or_else(|| Error::Embed("Qwen returned an invalid batch vector".into()))?;
+            let embedding: Vec<f32> = values
+                .iter()
+                .map(|value| value.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            if embedding.len() != DIMENSIONS {
+                return Err(Error::Embed(format!(
+                    "Qwen returned {} dimensions; expected {DIMENSIONS}",
+                    embedding.len()
+                )));
+            }
+            Ok(embedding)
+        })
+        .collect()
+}
+
 fn home_dir() -> PathBuf {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn automatic_batch_size() -> usize {
+    let total_vram_mib = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| output.lines().next()?.trim().parse::<usize>().ok());
+    match total_vram_mib {
+        Some(total) if total >= 20 * 1024 => 8,
+        Some(total) if total >= 12 * 1024 => 4,
+        _ => 2,
+    }
 }
