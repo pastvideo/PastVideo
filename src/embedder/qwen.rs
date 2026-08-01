@@ -233,15 +233,37 @@ impl Worker {
 
     fn read_response(&mut self) -> Result<Value> {
         let mut line = String::new();
-        if self.output.read_line(&mut line)? == 0 {
-            let status = self.child.try_wait().ok().flatten();
-            return Err(Error::Embed(format!(
-                "Qwen worker exited unexpectedly ({status:?})"
-            )));
+        let mut ignored_diagnostics = 0;
+        loop {
+            line.clear();
+            if self.output.read_line(&mut line)? == 0 {
+                let status = self.child.try_wait().ok().flatten();
+                return Err(Error::Embed(format!(
+                    "Qwen worker exited unexpectedly ({status:?})"
+                )));
+            }
+            match parse_protocol_line(&line)? {
+                Some(response) => return Ok(response),
+                None => {
+                    ignored_diagnostics += 1;
+                    if ignored_diagnostics >= 32 {
+                        return Err(Error::Embed(
+                            "Qwen worker produced too many non-protocol output lines".into(),
+                        ));
+                    }
+                }
+            }
         }
-        serde_json::from_str(&line)
-            .map_err(|error| Error::Embed(format!("invalid Qwen worker response: {error}")))
     }
+}
+
+fn parse_protocol_line(line: &str) -> Result<Option<Value>> {
+    if !line.trim_start().starts_with('{') {
+        return Ok(None);
+    }
+    serde_json::from_str(line)
+        .map(Some)
+        .map_err(|error| Error::Embed(format!("invalid Qwen worker response: {error}")))
 }
 
 impl Drop for Worker {
@@ -433,7 +455,7 @@ fn batch_size_for_vram(total_vram_mib: Option<usize>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::batch_size_for_vram;
+    use super::{batch_size_for_vram, parse_protocol_line};
 
     #[test]
     fn automatic_batch_size_scales_with_available_vram() {
@@ -442,5 +464,17 @@ mod tests {
         assert_eq!(batch_size_for_vram(Some(12 * 1024)), 4);
         assert_eq!(batch_size_for_vram(Some(8 * 1024)), 2);
         assert_eq!(batch_size_for_vram(None), 2);
+    }
+
+    #[test]
+    fn worker_protocol_ignores_decoder_diagnostics() {
+        assert!(parse_protocol_line("[decoder] fallback notice\n")
+            .unwrap()
+            .is_none());
+        let response = parse_protocol_line("  {\"ok\":true,\"pong\":true}\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["pong"], true);
+        assert!(parse_protocol_line("{not-json}\n").is_err());
     }
 }
