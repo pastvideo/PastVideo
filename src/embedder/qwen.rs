@@ -419,9 +419,28 @@ fn automatic_batch_size() -> usize {
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|output| output.lines().next()?.trim().parse::<usize>().ok());
+    batch_size_for_vram(total_vram_mib)
+}
+
+fn batch_size_for_vram(total_vram_mib: Option<usize>) -> usize {
     match total_vram_mib {
+        Some(total) if total >= 24_000 => 10,
         Some(total) if total >= 20 * 1024 => 8,
         Some(total) if total >= 12 * 1024 => 4,
         _ => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::batch_size_for_vram;
+
+    #[test]
+    fn automatic_batch_size_scales_with_available_vram() {
+        assert_eq!(batch_size_for_vram(Some(24_564)), 10);
+        assert_eq!(batch_size_for_vram(Some(20 * 1024)), 8);
+        assert_eq!(batch_size_for_vram(Some(12 * 1024)), 4);
+        assert_eq!(batch_size_for_vram(Some(8 * 1024)), 2);
+        assert_eq!(batch_size_for_vram(None), 2);
     }
 }

@@ -149,7 +149,8 @@ The default Qwen locations are:
 
 Override them with `PASTVIDEO_QWEN_PYTHON`, `PASTVIDEO_QWEN_MODEL`, and
 `PASTVIDEO_QWEN_WORKER`. `PASTVIDEO_QWEN_MAX_FRAMES` controls frames sampled per
-video chunk (default 16).
+video chunk (default 16). Video batch size scales automatically with detected
+VRAM (10 on a 24 GB card); `PASTVIDEO_QWEN_BATCH_SIZE` overrides it.
 
 The setup script prefers an existing CUDA-enabled PyTorch wheel from the local
 uv cache, otherwise installs the common CUDA 12.8 PyTorch toolset into the shared
