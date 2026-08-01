@@ -35,12 +35,22 @@ pub struct BenchmarkQuery {
     pub end_time: f64,
 }
 
+struct WorkerTimings {
+    decode_seconds: f64,
+    inference_seconds: f64,
+    elapsed_seconds: f64,
+    batches: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct BenchmarkReport {
     pub chunks: usize,
     pub mean_chunk_seconds: f64,
     pub stddev_chunk_seconds: f64,
     pub total_seconds: f64,
+    pub decode_seconds: f64,
+    pub inference_seconds: f64,
+    pub worker_seconds: f64,
     pub peak_gpu_memory: String,
     pub queries: Vec<BenchmarkQuery>,
     pub markdown: String,
@@ -107,12 +117,19 @@ pub fn run(data_dir: &Path, output_path: &Path) -> Result<BenchmarkReport> {
         / timings.len() as f64;
     let stddev = variance.sqrt();
     let total_seconds = runtime_started.elapsed().as_secs_f64();
+    let worker_timings = WorkerTimings {
+        decode_seconds: index.decode_ms.iter().sum::<u64>() as f64 / 1000.0,
+        inference_seconds: index.inference_ms.iter().sum::<u64>() as f64 / 1000.0,
+        elapsed_seconds: index.worker_elapsed_ms.iter().sum::<u64>() as f64 / 1000.0,
+        batches: index.worker_elapsed_ms.len(),
+    };
     let peak_gpu_memory = gpu_memory_used().unwrap_or_else(|| "unknown".into());
     let markdown = render_markdown(
         timings.len(),
         mean,
         stddev,
         total_seconds,
+        &worker_timings,
         &peak_gpu_memory,
         &query_results,
     );
@@ -123,6 +140,9 @@ pub fn run(data_dir: &Path, output_path: &Path) -> Result<BenchmarkReport> {
         mean_chunk_seconds: mean,
         stddev_chunk_seconds: stddev,
         total_seconds,
+        decode_seconds: worker_timings.decode_seconds,
+        inference_seconds: worker_timings.inference_seconds,
+        worker_seconds: worker_timings.elapsed_seconds,
         peak_gpu_memory,
         queries: query_results,
         markdown,
@@ -184,9 +204,16 @@ fn render_markdown(
     mean: f64,
     stddev: f64,
     total_seconds: f64,
+    worker: &WorkerTimings,
     peak_gpu_memory: &str,
     queries: &[BenchmarkQuery],
 ) -> String {
+    let WorkerTimings {
+        decode_seconds,
+        inference_seconds,
+        elapsed_seconds: worker_seconds,
+        batches: worker_batches,
+    } = worker;
     let qwen = QwenConfig::from_env().ok();
     let python_version = qwen
         .as_ref()
@@ -221,6 +248,7 @@ fn render_markdown(
 - **Quantized:** no\n\
 - **Per-chunk time:** {mean:.2}s ± {stddev:.2}s (n={chunks})\n\
 - **Total run time:** {:.1}m\n\
+- **Worker stages:** {decode_seconds:.1}s decode + {inference_seconds:.1}s inference; {worker_seconds:.1}s elapsed across {worker_batches} requests\n\
 - **Observed GPU memory:** {peak_gpu_memory}\n\
 - **Status:** {status}\n\n\
 | Query | Top score | Best span |\n\

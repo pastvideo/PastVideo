@@ -229,7 +229,7 @@ fn backend_mismatch_is_rejected() {
 }
 
 #[test]
-fn direct_span_backend_batches_and_reports_live_progress() {
+fn direct_span_backend_fills_requests_across_videos_and_reports_live_progress() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not on PATH");
         return;
@@ -248,6 +248,9 @@ fn direct_span_backend_batches_and_reports_live_progress() {
         }
         fn video_batch_size(&self) -> usize {
             2
+        }
+        fn video_request_batch_size(&self) -> usize {
+            4
         }
         fn supports_video_spans(&self) -> bool {
             true
@@ -274,8 +277,9 @@ fn direct_span_backend_batches_and_reports_live_progress() {
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let video = tmp.path().join("long.mp4");
-    make_color_video(&video, "blue", 70);
+    make_color_video(&tmp.path().join("blue.mp4"), "blue", 4);
+    make_color_video(&tmp.path().join("green.mp4"), "green", 4);
+    make_color_video(&tmp.path().join("red.mp4"), "red", 4);
     let batch_sizes = Arc::new(Mutex::new(Vec::new()));
     let backend = SpanBackend {
         batch_sizes: Arc::clone(&batch_sizes),
@@ -293,10 +297,10 @@ fn direct_span_backend_batches_and_reports_live_progress() {
         .unwrap();
 
     assert_eq!(report.new_chunks, 3);
-    assert_eq!(*batch_sizes.lock().unwrap(), vec![2, 1]);
+    assert_eq!(*batch_sizes.lock().unwrap(), vec![3]);
     let last = progress.last().expect("a final progress update");
-    assert_eq!(last.files_completed, 1);
-    assert_eq!(last.files_total, 1);
+    assert_eq!(last.files_completed, 3);
+    assert_eq!(last.files_total, 3);
     assert_eq!(last.chunks_completed, 3);
     assert_eq!(last.chunks_total, 3);
     assert_eq!(last.new_chunks, 3);

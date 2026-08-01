@@ -25,6 +25,15 @@ pub struct VideoSpan {
     pub end_time: f64,
 }
 
+/// Timing reported by a backend for its most recent video batch.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EmbedBatchMetrics {
+    pub items: usize,
+    pub decode_ms: u64,
+    pub inference_ms: u64,
+    pub elapsed_ms: u64,
+}
+
 /// Maps a video chunk, a text query, or an image into a shared vector space.
 ///
 /// All three must land in the *same* space and share the same [`dimensions`],
@@ -47,6 +56,18 @@ pub trait Embedder: Send + Sync {
     /// Preferred number of clips per video embedding request.
     fn video_batch_size(&self) -> usize {
         1
+    }
+
+    /// Preferred number of clips sent in one worker request. A backend may
+    /// request more than one GPU microbatch so it can overlap decoding the
+    /// next microbatch with inference on the current one.
+    fn video_request_batch_size(&self) -> usize {
+        self.video_batch_size()
+    }
+
+    /// Consume timing details for the most recently completed video batch.
+    fn take_last_batch_metrics(&self) -> Option<EmbedBatchMetrics> {
+        None
     }
 
     /// Whether the backend can embed time spans directly from source videos.
@@ -110,6 +131,14 @@ impl Embedder for SharedEmbedder {
 
     fn video_batch_size(&self) -> usize {
         self.0.video_batch_size()
+    }
+
+    fn video_request_batch_size(&self) -> usize {
+        self.0.video_request_batch_size()
+    }
+
+    fn take_last_batch_metrics(&self) -> Option<EmbedBatchMetrics> {
+        self.0.take_last_batch_metrics()
     }
 
     fn supports_video_spans(&self) -> bool {

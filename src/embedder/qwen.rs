@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-use crate::embedder::{Embedder, VideoSpan};
+use crate::embedder::{EmbedBatchMetrics, Embedder, VideoSpan};
 use crate::error::{Error, Result};
 
 pub const BACKEND: &str = "qwen3-vl";
@@ -22,6 +22,7 @@ pub struct QwenConfig {
     pub worker_script: PathBuf,
     pub max_frames: usize,
     pub batch_size: usize,
+    pub request_batch_size: usize,
 }
 
 impl QwenConfig {
@@ -58,6 +59,11 @@ impl QwenConfig {
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(automatic_batch_size)
             .clamp(1, 12);
+        let request_batch_size = env::var("PASTVIDEO_QWEN_REQUEST_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(batch_size.saturating_mul(2))
+            .clamp(batch_size, 24);
 
         for (label, path) in [
             ("Qwen Python runtime", &python),
@@ -78,6 +84,7 @@ impl QwenConfig {
             worker_script,
             max_frames,
             batch_size,
+            request_batch_size,
         })
     }
 }
@@ -96,6 +103,8 @@ impl Worker {
             .arg(&config.model_path)
             .arg("--max-frames")
             .arg(config.max_frames.to_string())
+            .arg("--batch-size")
+            .arg(config.batch_size.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -199,7 +208,7 @@ impl Worker {
             .collect()
     }
 
-    fn request_spans(&mut self, spans: &[VideoSpan]) -> Result<Vec<Vec<f32>>> {
+    fn request_spans(&mut self, spans: &[VideoSpan]) -> Result<(Vec<Vec<f32>>, EmbedBatchMetrics)> {
         let spans: Vec<_> = spans
             .iter()
             .map(|span| {
@@ -217,7 +226,9 @@ impl Worker {
         .map_err(|error| Error::Embed(format!("could not encode Qwen span request: {error}")))?;
         self.input.write_all(b"\n")?;
         self.input.flush()?;
-        parse_batch_response(self.read_response()?)
+        let response = self.read_response()?;
+        let metrics = parse_batch_metrics(&response, spans.len());
+        Ok((parse_batch_response(response)?, metrics))
     }
 
     fn request_texts(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -276,6 +287,7 @@ impl Drop for Worker {
 pub struct QwenEmbedder {
     config: QwenConfig,
     worker: Mutex<Option<Worker>>,
+    last_batch_metrics: Mutex<Option<EmbedBatchMetrics>>,
 }
 
 impl QwenEmbedder {
@@ -283,6 +295,7 @@ impl QwenEmbedder {
         Ok(Self {
             config,
             worker: Mutex::new(None),
+            last_batch_metrics: Mutex::new(None),
         })
     }
 
@@ -326,10 +339,22 @@ impl QwenEmbedder {
         if worker.is_none() {
             *worker = Some(Worker::start(&self.config)?);
         }
-        worker
+        let result = worker
             .as_mut()
             .expect("Qwen worker was initialized")
-            .request_spans(spans)
+            .request_spans(spans);
+        drop(worker);
+        match result {
+            Ok((embeddings, metrics)) => {
+                *self
+                    .last_batch_metrics
+                    .lock()
+                    .map_err(|_| Error::Embed("Qwen metrics lock was poisoned".into()))? =
+                    Some(metrics);
+                Ok(embeddings)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn request_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -358,6 +383,17 @@ impl Embedder for QwenEmbedder {
 
     fn video_batch_size(&self) -> usize {
         self.config.batch_size
+    }
+
+    fn video_request_batch_size(&self) -> usize {
+        self.config.request_batch_size
+    }
+
+    fn take_last_batch_metrics(&self) -> Option<EmbedBatchMetrics> {
+        self.last_batch_metrics
+            .lock()
+            .ok()
+            .and_then(|mut metrics| metrics.take())
     }
 
     fn supports_video_spans(&self) -> bool {
@@ -424,6 +460,16 @@ fn parse_batch_response(response: Value) -> Result<Vec<Vec<f32>>> {
             Ok(embedding)
         })
         .collect()
+}
+
+fn parse_batch_metrics(response: &Value, items: usize) -> EmbedBatchMetrics {
+    let milliseconds = |name| response.get(name).and_then(Value::as_u64).unwrap_or(0);
+    EmbedBatchMetrics {
+        items,
+        decode_ms: milliseconds("decode_ms"),
+        inference_ms: milliseconds("inference_ms"),
+        elapsed_ms: milliseconds("elapsed_ms"),
+    }
 }
 
 fn home_dir() -> PathBuf {

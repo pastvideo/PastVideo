@@ -20,7 +20,7 @@ use crate::embedder::{default_embedder, Embedder, VideoSpan};
 use crate::error::{is_permanent_failure, Error, Result};
 use crate::highlights::{rank_highlights, AgainstMode, Anomaly, Method as HighlightMethod};
 use crate::search::{search_with_embedding, search_with_embedding_in_sources};
-use crate::store::{make_chunk_id, Hit, MetaKey, SentryStore, Stats};
+use crate::store::{make_chunk_id, ChunkInsert, Hit, MetaKey, SentryStore, Stats};
 use crate::trimmer::{trim_clip, DEFAULT_PADDING};
 
 const DB_FILENAME: &str = "pastvideo.db";
@@ -67,6 +67,10 @@ pub struct IndexReport {
     pub cancelled: bool,
     /// End-to-end embed time for each newly attempted chunk.
     pub embed_ms: Vec<u64>,
+    /// Worker stage timings, one entry per successful GPU batch request.
+    pub decode_ms: Vec<u64>,
+    pub inference_ms: Vec<u64>,
+    pub worker_elapsed_ms: Vec<u64>,
 }
 
 /// A point-in-time indexing update suitable for native UI progress displays.
@@ -82,9 +86,18 @@ pub struct IndexProgress {
 
 struct PendingEmbedding {
     path: PathBuf,
+    source_file: String,
     chunk_id: String,
     start_time: f64,
     end_time: f64,
+    file_index: usize,
+}
+
+struct SpanFileProgress {
+    path: PathBuf,
+    total_chunks: usize,
+    completed_chunks: usize,
+    new_chunks: usize,
 }
 
 /// A ranked search match.
@@ -248,6 +261,9 @@ impl Database {
             files_scanned: videos.len(),
             ..Default::default()
         };
+        if self.embedder.supports_video_spans() {
+            return self.insert_span_paths(videos, on_progress, should_cancel, report);
+        }
         let cfg = &self.config;
         let files_total = videos.len();
         let chunks_total = videos
@@ -363,13 +379,19 @@ impl Database {
                     }
                     pending.push(PendingEmbedding {
                         path: abs.clone(),
+                        source_file: abs_str.clone(),
                         chunk_id,
                         start_time: *start_time,
                         end_time: *end_time,
+                        file_index: 0,
                     });
                     if pending.len() >= self.embedder.video_batch_size().max(1) {
                         let batch_len = pending.len();
-                        file_new += self.embed_pending_batch(&pending, &abs_str, &mut report)?;
+                        file_new += self
+                            .embed_pending_batch(&pending, &mut report)?
+                            .into_iter()
+                            .filter(|embedded| *embedded)
+                            .count();
                         pending.clear();
                         chunks_completed += batch_len;
                         on_progress(IndexProgress {
@@ -384,7 +406,11 @@ impl Database {
                 }
                 if !cancelled && !pending.is_empty() {
                     let batch_len = pending.len();
-                    file_new += self.embed_pending_batch(&pending, &abs_str, &mut report)?;
+                    file_new += self
+                        .embed_pending_batch(&pending, &mut report)?
+                        .into_iter()
+                        .filter(|embedded| *embedded)
+                        .count();
                     chunks_completed += batch_len;
                     on_progress(IndexProgress {
                         files_completed,
@@ -506,15 +532,21 @@ impl Database {
 
                 pending.push(PendingEmbedding {
                     path: embed_path,
+                    source_file: abs_str.clone(),
                     chunk_id,
                     start_time: chunk.start_time,
                     end_time: chunk.end_time,
+                    file_index: 0,
                 });
                 files_to_cleanup.push(chunk.path.clone());
 
                 if pending.len() >= self.embedder.video_batch_size().max(1) {
                     let batch_len = pending.len();
-                    file_new += self.embed_pending_batch(&pending, &abs_str, &mut report)?;
+                    file_new += self
+                        .embed_pending_batch(&pending, &mut report)?
+                        .into_iter()
+                        .filter(|embedded| *embedded)
+                        .count();
                     pending.clear();
                     chunks_completed += batch_len;
                     on_progress(IndexProgress {
@@ -530,7 +562,11 @@ impl Database {
 
             if !cancelled && !pending.is_empty() {
                 let batch_len = pending.len();
-                file_new += self.embed_pending_batch(&pending, &abs_str, &mut report)?;
+                file_new += self
+                    .embed_pending_batch(&pending, &mut report)?
+                    .into_iter()
+                    .filter(|embedded| *embedded)
+                    .count();
                 chunks_completed += batch_len;
                 on_progress(IndexProgress {
                     files_completed,
@@ -574,12 +610,164 @@ impl Database {
         Ok(report)
     }
 
+    fn insert_span_paths(
+        &self,
+        videos: Vec<PathBuf>,
+        on_progress: &mut dyn FnMut(IndexProgress),
+        should_cancel: &dyn Fn() -> bool,
+        mut report: IndexReport,
+    ) -> Result<IndexReport> {
+        let cfg = &self.config;
+        let files_total = videos.len();
+        let mut files = Vec::with_capacity(files_total);
+        let mut pending = Vec::new();
+        let mut chunks_total = 0usize;
+
+        // Plan once so durations are not probed twice and short videos can
+        // share the same GPU request.
+        for video_path in videos {
+            if should_cancel() {
+                report.cancelled = true;
+                report.total_chunks = self.store.count()?;
+                return Ok(report);
+            }
+            let abs = match video_path.canonicalize() {
+                Ok(path) => path,
+                Err(_) => {
+                    let source_file = video_path.to_string_lossy().to_string();
+                    let id = make_chunk_id(&source_file, 0.0);
+                    if cfg.retry_failed || !self.dlq.contains(&id).unwrap_or(false) {
+                        self.dlq
+                            .record(&id, &source_file, 0.0, 0.0, "file not found", 1)?;
+                        report.dlq_chunks += 1;
+                    }
+                    files.push(SpanFileProgress {
+                        path: video_path,
+                        total_chunks: 0,
+                        completed_chunks: 0,
+                        new_chunks: 0,
+                    });
+                    continue;
+                }
+            };
+            let source_file = abs.to_string_lossy().to_string();
+            let spans = video_duration(&abs)
+                .and_then(|duration| {
+                    expected_chunk_spans(duration, cfg.chunk_duration, cfg.overlap)
+                })
+                .unwrap_or_default();
+            let file_index = files.len();
+            let mut completed_chunks = 0usize;
+            for (start_time, end_time) in &spans {
+                let chunk_id = make_chunk_id(&source_file, *start_time);
+                if self.store.has_chunk(&chunk_id)? {
+                    completed_chunks += 1;
+                    continue;
+                }
+                if self.dlq.contains(&chunk_id)? && !cfg.retry_failed {
+                    completed_chunks += 1;
+                    continue;
+                }
+                if cfg.retry_failed {
+                    let _ = self.dlq.remove(&chunk_id);
+                }
+                pending.push(PendingEmbedding {
+                    path: abs.clone(),
+                    source_file: source_file.clone(),
+                    chunk_id,
+                    start_time: *start_time,
+                    end_time: *end_time,
+                    file_index,
+                });
+            }
+            chunks_total += spans.len();
+            files.push(SpanFileProgress {
+                path: abs,
+                total_chunks: spans.len(),
+                completed_chunks,
+                new_chunks: 0,
+            });
+        }
+
+        let mut files_completed = 0usize;
+        let mut next_file = 0usize;
+        let mut chunks_completed = files.iter().map(|file| file.completed_chunks).sum();
+        while next_file < files.len()
+            && files[next_file].completed_chunks == files[next_file].total_chunks
+        {
+            files_completed += 1;
+            on_progress(IndexProgress {
+                files_completed,
+                files_total,
+                chunks_completed,
+                chunks_total,
+                new_chunks: report.new_chunks,
+                current_file: files[next_file].path.clone(),
+            });
+            next_file += 1;
+        }
+
+        let request_size = self.embedder.video_request_batch_size().max(1);
+        let mut offset = 0usize;
+        while offset < pending.len() {
+            if should_cancel() {
+                report.cancelled = true;
+                break;
+            }
+            let end = (offset + request_size).min(pending.len());
+            let batch = &pending[offset..end];
+            let results = self.embed_pending_batch(batch, &mut report)?;
+            for (item, embedded) in batch.iter().zip(results) {
+                let file = &mut files[item.file_index];
+                file.completed_chunks += 1;
+                if embedded {
+                    file.new_chunks += 1;
+                    report.new_chunks += 1;
+                }
+            }
+            chunks_completed += batch.len();
+            offset = end;
+
+            while next_file < files.len()
+                && files[next_file].completed_chunks == files[next_file].total_chunks
+            {
+                files_completed += 1;
+                on_progress(IndexProgress {
+                    files_completed,
+                    files_total,
+                    chunks_completed,
+                    chunks_total,
+                    new_chunks: report.new_chunks,
+                    current_file: files[next_file].path.clone(),
+                });
+                next_file += 1;
+            }
+            if next_file < files.len() {
+                let current_file = batch
+                    .last()
+                    .map(|item| files[item.file_index].path.clone())
+                    .unwrap_or_else(|| files[next_file].path.clone());
+                on_progress(IndexProgress {
+                    files_completed,
+                    files_total,
+                    chunks_completed,
+                    chunks_total,
+                    new_chunks: report.new_chunks,
+                    current_file,
+                });
+            }
+        }
+
+        report.files_indexed = files.iter().filter(|file| file.new_chunks > 0).count();
+        report.total_chunks = self.store.count()?;
+        Ok(report)
+    }
+
     fn embed_pending_batch(
         &self,
         pending: &[PendingEmbedding],
-        source_file: &str,
         report: &mut IndexReport,
-    ) -> Result<usize> {
+    ) -> Result<Vec<bool>> {
         if pending.len() > 1 {
             let started = Instant::now();
             let batch_result = if self.embedder.supports_video_spans() {
@@ -600,36 +788,49 @@ impl Database {
                 if embeddings.len() == pending.len() {
                     let elapsed_each =
                         (started.elapsed().as_millis() as u64 / pending.len() as u64).max(1);
-                    for (item, embedding) in pending.iter().zip(embeddings) {
-                        self.validate_embedding(&embedding)?;
-                        self.store.add_chunk(
-                            &item.chunk_id,
-                            &embedding,
-                            source_file,
-                            item.start_time,
-                            item.end_time,
-                            self.embedder.backend(),
-                            Some(self.embedder.model()),
-                        )?;
+                    for embedding in &embeddings {
+                        self.validate_embedding(embedding)?;
+                    }
+                    let inserts: Vec<_> = pending
+                        .iter()
+                        .zip(&embeddings)
+                        .map(|(item, embedding)| ChunkInsert {
+                            id: &item.chunk_id,
+                            embedding,
+                            source_file: &item.source_file,
+                            start_time: item.start_time,
+                            end_time: item.end_time,
+                            backend: self.embedder.backend(),
+                            model: Some(self.embedder.model()),
+                        })
+                        .collect();
+                    self.store.add_chunks(&inserts)?;
+                    for _ in pending {
                         report.embed_ms.push(elapsed_each);
                     }
-                    return Ok(pending.len());
+                    if let Some(metrics) = self.embedder.take_last_batch_metrics() {
+                        report.decode_ms.push(metrics.decode_ms);
+                        report.inference_ms.push(metrics.inference_ms);
+                        report.worker_elapsed_ms.push(metrics.elapsed_ms);
+                    }
+                    return Ok(vec![true; pending.len()]);
                 }
             }
             // If a backend rejects a batch (for example because VRAM is tight),
             // retry each clip through the proven single-item path.
         }
 
-        let mut embedded_count = 0usize;
-        for item in pending {
+        let mut results = vec![false; pending.len()];
+        let mut successful = Vec::new();
+        for (position, item) in pending.iter().enumerate() {
             let started = Instant::now();
             let embedded = if self.embedder.supports_video_spans() {
-                self.embed_span_with_retry(item, source_file)?
+                self.embed_span_with_retry(item)?
             } else {
                 self.embed_with_retry(
                     &item.path,
                     &item.chunk_id,
-                    source_file,
+                    &item.source_file,
                     item.start_time,
                     item.end_time,
                 )?
@@ -638,28 +839,32 @@ impl Database {
             match embedded {
                 Some(embedding) => {
                     self.validate_embedding(&embedding)?;
-                    self.store.add_chunk(
-                        &item.chunk_id,
-                        &embedding,
-                        source_file,
-                        item.start_time,
-                        item.end_time,
-                        self.embedder.backend(),
-                        Some(self.embedder.model()),
-                    )?;
-                    embedded_count += 1;
+                    results[position] = true;
+                    successful.push((position, embedding));
                 }
                 None => report.dlq_chunks += 1,
             }
         }
-        Ok(embedded_count)
+        let inserts: Vec<_> = successful
+            .iter()
+            .map(|(position, embedding)| {
+                let item = &pending[*position];
+                ChunkInsert {
+                    id: &item.chunk_id,
+                    embedding,
+                    source_file: &item.source_file,
+                    start_time: item.start_time,
+                    end_time: item.end_time,
+                    backend: self.embedder.backend(),
+                    model: Some(self.embedder.model()),
+                }
+            })
+            .collect();
+        self.store.add_chunks(&inserts)?;
+        Ok(results)
     }
 
-    fn embed_span_with_retry(
-        &self,
-        item: &PendingEmbedding,
-        source_file: &str,
-    ) -> Result<Option<Vec<f32>>> {
+    fn embed_span_with_retry(&self, item: &PendingEmbedding) -> Result<Option<Vec<f32>>> {
         let span = VideoSpan {
             path: item.path.clone(),
             start_time: item.start_time,
@@ -677,7 +882,7 @@ impl Database {
                     if attempt == max {
                         self.dlq.record(
                             &item.chunk_id,
-                            source_file,
+                            &item.source_file,
                             item.start_time,
                             item.end_time,
                             &error.to_string(),
@@ -690,7 +895,7 @@ impl Database {
                     if is_permanent_failure(&error) || attempt == max {
                         self.dlq.record(
                             &item.chunk_id,
-                            source_file,
+                            &item.source_file,
                             item.start_time,
                             item.end_time,
                             &error.to_string(),

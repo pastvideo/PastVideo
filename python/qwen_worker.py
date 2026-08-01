@@ -65,11 +65,13 @@ _HW_DECODE_SETTING = os.environ.get(
     "PASTVIDEO_QWEN_HW_DECODE", "auto"
 ).strip().lower()
 _HW_DECODE_MIN_PIXELS = int(
-    os.environ.get("PASTVIDEO_QWEN_HW_DECODE_MIN_PIXELS", "1500000")
+    os.environ.get("PASTVIDEO_QWEN_HW_DECODE_MIN_PIXELS", "800000")
 )
 _FFMPEG_HW_DECODE_MIN_PIXELS = int(
-    os.environ.get("PASTVIDEO_QWEN_FFMPEG_HW_DECODE_MIN_PIXELS", "3000000")
+    os.environ.get("PASTVIDEO_QWEN_FFMPEG_HW_DECODE_MIN_PIXELS", "1500000")
 )
+_GC_INTERVAL = max(1, int(os.environ.get("PASTVIDEO_QWEN_GC_INTERVAL", "8")))
+_BATCHES_SINCE_GC = 0
 _CUDA_DECODE_ENABLED = False
 _SUBPROCESS_FLAGS = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -106,6 +108,16 @@ atexit.register(close_video_readers)
 
 def emit(payload: dict) -> None:
     print(json.dumps(payload, separators=(",", ":")), flush=True)
+
+
+def maybe_collect() -> None:
+    """Run costly full Python collection occasionally, not every batch."""
+
+    global _BATCHES_SINCE_GC
+    _BATCHES_SINCE_GC += 1
+    if _BATCHES_SINCE_GC >= _GC_INTERVAL:
+        gc.collect()
+        _BATCHES_SINCE_GC = 0
 
 
 def decoder_path(path: str) -> str:
@@ -661,6 +673,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=16)
     parser.add_argument("--max-pixels", type=int, default=230_400)
     parser.add_argument("--total-pixels", type=int, default=_DEFAULT_TOTAL_PIXELS)
+    parser.add_argument("--batch-size", type=int, default=2)
     return parser.parse_args()
 
 
@@ -673,6 +686,53 @@ def embed_payloads(model, payloads: list[dict]) -> tuple[list[list[float]], int]
     inference_ms = round((time.perf_counter() - inference_started) * 1000)
     del values
     return embeddings, inference_ms
+
+
+def embed_video_span_batches(
+    model,
+    spans: list[dict],
+    max_frames: int,
+    total_pixels: int,
+    batch_size: int,
+) -> tuple[list[list[float]], int, int, int]:
+    """Double-buffer decoding while preserving input and embedding order.
+
+    Only one decoded microbatch is allowed ahead of inference, keeping host
+    memory bounded while the CPU/NVDEC prepares the next GPU batch.
+    """
+
+    microbatches = [
+        spans[offset : offset + batch_size]
+        for offset in range(0, len(spans), batch_size)
+    ]
+    if not microbatches:
+        return [], 0, 0, 0
+
+    def decode(batch: list[dict]) -> tuple[list[dict], int]:
+        decode_started = time.perf_counter()
+        payloads = video_span_payloads(batch, max_frames, total_pixels)
+        return payloads, round((time.perf_counter() - decode_started) * 1000)
+
+    embeddings: list[list[float]] = []
+    decode_ms = 0
+    inference_ms = 0
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending_decode = executor.submit(decode, microbatches[0])
+        for position in range(len(microbatches)):
+            payloads, batch_decode_ms = pending_decode.result()
+            decode_ms += batch_decode_ms
+            if position + 1 < len(microbatches):
+                pending_decode = executor.submit(
+                    decode, microbatches[position + 1]
+                )
+            batch_embeddings, batch_inference_ms = embed_payloads(
+                model, payloads
+            )
+            embeddings.extend(batch_embeddings)
+            inference_ms += batch_inference_ms
+            del payloads, batch_embeddings
+            maybe_collect()
+    return embeddings, decode_ms, inference_ms, len(microbatches)
 
 
 def main() -> int:
@@ -727,6 +787,7 @@ def main() -> int:
                 else "decord"
             ),
             "total_pixels": args.total_pixels,
+            "batch_size": args.batch_size,
             "dimensions": 2048,
             "load_ms": round((time.perf_counter() - started) * 1000),
         }
@@ -766,7 +827,7 @@ def main() -> int:
                 )
                 embeddings, inference_ms = embed_payloads(model, payloads)
                 del payloads
-                gc.collect()
+                maybe_collect()
                 emit(
                     {
                         "ok": True,
@@ -780,22 +841,25 @@ def main() -> int:
                 )
                 continue
             elif operation == "video_span_batch":
-                decode_started = time.perf_counter()
-                payloads = video_span_payloads(
-                    request["spans"], args.max_frames, args.total_pixels
+                (
+                    embeddings,
+                    decode_ms,
+                    inference_ms,
+                    microbatches,
+                ) = embed_video_span_batches(
+                    model,
+                    request["spans"],
+                    args.max_frames,
+                    args.total_pixels,
+                    max(1, args.batch_size),
                 )
-                decode_ms = round(
-                    (time.perf_counter() - decode_started) * 1000
-                )
-                embeddings, inference_ms = embed_payloads(model, payloads)
-                del payloads
-                gc.collect()
                 emit(
                     {
                         "ok": True,
                         "embeddings": embeddings,
                         "decode_ms": decode_ms,
                         "inference_ms": inference_ms,
+                        "microbatches": microbatches,
                         "elapsed_ms": round(
                             (time.perf_counter() - started) * 1000
                         ),
@@ -809,7 +873,7 @@ def main() -> int:
                 ]
                 embeddings, inference_ms = embed_payloads(model, payloads)
                 del payloads
-                gc.collect()
+                maybe_collect()
                 emit(
                     {
                         "ok": True,

@@ -40,6 +40,17 @@ pub struct ChunkRow {
     pub embedding: Vec<f32>,
 }
 
+/// One vector-store write. Batches of these are committed atomically.
+pub(crate) struct ChunkInsert<'a> {
+    pub id: &'a str,
+    pub embedding: &'a [f32],
+    pub source_file: &'a str,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub backend: &'a str,
+    pub model: Option<&'a str>,
+}
+
 #[derive(Debug, Default)]
 pub struct Stats {
     pub total_chunks: i64,
@@ -118,16 +129,32 @@ impl SentryStore {
         backend: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+        self.add_chunks(&[ChunkInsert {
+            id,
+            embedding,
+            source_file,
+            start_time,
+            end_time,
+            backend,
+            model,
+        }])
+    }
+
+    /// Normalize and upsert a worker batch in one SQLite transaction.
+    pub(crate) fn add_chunks(&self, chunks: &[ChunkInsert<'_>]) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        if chunks.iter().any(|chunk| {
+            chunk.embedding.is_empty() || chunk.embedding.iter().any(|value| !value.is_finite())
+        }) {
             return Err(Error::InvalidInput(
                 "embedding must be non-empty and contain only finite values".into(),
             ));
         }
-        let normalized = normalize_f32(embedding);
-        let blob = encode_embedding(&normalized);
-        let dim = embedding.len() as i64;
-        let now = now_iso();
-        self.conn.execute(
+
+        let transaction = self.conn.unchecked_transaction()?;
+        let mut statement = transaction.prepare_cached(
             "INSERT INTO chunks(id,source_file,start_time,end_time,dim,embedding,backend,model,indexed_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(id) DO UPDATE SET
@@ -139,8 +166,25 @@ impl SentryStore {
                backend=excluded.backend,
                model=excluded.model,
                indexed_at=excluded.indexed_at",
-            params![id, source_file, start_time, end_time, dim, blob, backend, model, now],
         )?;
+        let now = now_iso();
+        for chunk in chunks {
+            let normalized = normalize_f32(chunk.embedding);
+            let blob = encode_embedding(&normalized);
+            statement.execute(params![
+                chunk.id,
+                chunk.source_file,
+                chunk.start_time,
+                chunk.end_time,
+                chunk.embedding.len() as i64,
+                blob,
+                chunk.backend,
+                chunk.model,
+                now,
+            ])?;
+        }
+        drop(statement);
+        transaction.commit()?;
         Ok(())
     }
 
@@ -427,6 +471,71 @@ mod tests {
         assert!(hits[0].score > hits[1].score);
 
         assert_eq!(store.clear().unwrap(), 2);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn batch_writes_commit_all_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SentryStore::open(&dir.path().join("batch.db")).unwrap();
+        let first = vec![1.0, 0.0];
+        let second = vec![0.0, 1.0];
+        store
+            .add_chunks(&[
+                ChunkInsert {
+                    id: "first",
+                    embedding: &first,
+                    source_file: "/first.mp4",
+                    start_time: 0.0,
+                    end_time: 30.0,
+                    backend: "test",
+                    model: Some("test-v1"),
+                },
+                ChunkInsert {
+                    id: "second",
+                    embedding: &second,
+                    source_file: "/second.mp4",
+                    start_time: 0.0,
+                    end_time: 30.0,
+                    backend: "test",
+                    model: Some("test-v1"),
+                },
+            ])
+            .unwrap();
+        assert_eq!(store.count().unwrap(), 2);
+        assert_eq!(
+            store.search(&second, 1, false).unwrap()[0].source_file,
+            "/second.mp4"
+        );
+    }
+
+    #[test]
+    fn invalid_batch_does_not_partially_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SentryStore::open(&dir.path().join("atomic.db")).unwrap();
+        let valid = vec![1.0, 0.0];
+        let invalid = vec![f32::NAN, 1.0];
+        let result = store.add_chunks(&[
+            ChunkInsert {
+                id: "valid",
+                embedding: &valid,
+                source_file: "/valid.mp4",
+                start_time: 0.0,
+                end_time: 30.0,
+                backend: "test",
+                model: Some("test-v1"),
+            },
+            ChunkInsert {
+                id: "invalid",
+                embedding: &invalid,
+                source_file: "/invalid.mp4",
+                start_time: 0.0,
+                end_time: 30.0,
+                backend: "test",
+                model: Some("test-v1"),
+            },
+        ]);
+        assert!(result.is_err());
         assert_eq!(store.count().unwrap(), 0);
     }
 }

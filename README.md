@@ -28,7 +28,8 @@ Provider choices in Settings:
 
 Indexes are isolated by provider/model so incompatible vectors never mix. API
 keys are held in memory and are not written to the preferences file. Supported
-library formats are MP4, MOV, M4V, MKV, AVI, WebM, WMV, MTS, and M2TS.
+library formats are MP4, MOV, M4V, MKV, AVI, WebM, WMV, MPG/MPEG, 3GP/3G2,
+FLV/F4V, OGV, and VOB. MTS and M2TS files are intentionally excluded.
 
 To build a portable Windows folder containing `PastVideo.exe` and the available
 ffmpeg tools:
