@@ -12,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{Error, Result};
 
 pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &[
-    ".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".wmv", ".mts", ".m2ts",
+    ".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".wmv", ".mts", ".m2ts", ".mpg", ".mpeg",
+    ".3gp", ".3g2", ".flv", ".f4v", ".ogv", ".vob",
 ];
 
 /// Number of frames the baseline embedder samples per chunk.
@@ -455,7 +456,7 @@ pub fn extract_image_frame(path: &Path, width: usize, height: usize) -> Result<F
 // directory scan
 // ---------------------------------------------------------------------------
 
-/// Recursively find supported video files (`.mp4`, `.mov`) under `dir`.
+/// Recursively find regular files with a supported terminal video extension.
 pub fn scan_directory(dir: &Path) -> Vec<PathBuf> {
     let mut out = vec![];
     walk(dir, &mut out);
@@ -469,9 +470,12 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             walk(&p, out);
-        } else if is_supported_video_file(&p) {
+        } else if file_type.is_file() && is_supported_video_file(&p) {
             out.push(p);
         }
     }
@@ -480,11 +484,11 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 pub fn is_supported_video_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| {
-            let e = format!(".{}", e.to_lowercase());
-            SUPPORTED_VIDEO_EXTENSIONS.contains(&e.as_str())
+        .is_some_and(|extension| {
+            SUPPORTED_VIDEO_EXTENSIONS
+                .iter()
+                .any(|supported| extension.eq_ignore_ascii_case(supported.trim_start_matches('.')))
         })
-        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -540,7 +544,29 @@ mod tests {
         assert!(is_supported_video_file(Path::new("/a/b.mov")));
         assert!(is_supported_video_file(Path::new("/a/b.mkv")));
         assert!(is_supported_video_file(Path::new("/a/b.WEBM")));
+        assert!(is_supported_video_file(Path::new("/a/b.mpeg")));
         assert!(!is_supported_video_file(Path::new("/a/b.txt")));
+        assert!(!is_supported_video_file(Path::new("/a/b.mp4.txt")));
+        assert!(!is_supported_video_file(Path::new("/a/b")));
+        assert!(!is_supported_video_file(Path::new("/a/.mp4")));
+    }
+
+    #[test]
+    fn directory_scan_only_returns_regular_video_suffixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let expected = [temp.path().join("clip.MP4"), nested.join("movie.mkv")];
+        for path in &expected {
+            fs::write(path, b"test fixture").unwrap();
+        }
+        for name in ["photo.jpg", "notes", "partial.mp4.download", "fake.mov.txt"] {
+            fs::write(temp.path().join(name), b"not a video").unwrap();
+        }
+        fs::create_dir(temp.path().join("not-a-file.mp4")).unwrap();
+
+        let found = scan_directory(temp.path());
+        assert_eq!(found, expected);
     }
 
     #[test]
