@@ -1278,50 +1278,6 @@ impl PastVideoApp {
             })
     }
 
-    fn show_top_bar(&mut self, root: &mut egui::Ui) {
-        egui::Panel::top("top_bar")
-            .exact_size(68.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(INK)
-                    .inner_margin(egui::Margin::symmetric(22, 12)),
-            )
-            .show(root, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("PAST").size(20.0).strong().color(CREAM));
-                    ui.label(RichText::new("VIDEO").size(20.0).strong().color(SIGNAL));
-                    ui.add_space(16.0);
-                    ui.label(
-                        RichText::new("YOUR FOOTAGE, FINDABLE")
-                            .monospace()
-                            .size(10.0)
-                            .color(MUTED),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new("Settings").fill(PANEL_RAISED))
-                            .clicked()
-                        {
-                            self.settings_draft = self.preferences.embedding.clone();
-                            self.settings_open = true;
-                        }
-                        ui.label(
-                            RichText::new(self.preferences.embedding.provider.short_label())
-                                .monospace()
-                                .size(10.0)
-                                .color(SIGNAL),
-                        );
-                        ui.label(
-                            RichText::new("EMBEDDINGS")
-                                .monospace()
-                                .size(9.0)
-                                .color(MUTED),
-                        );
-                    });
-                });
-            });
-    }
-
     fn show_sidebar(&mut self, root: &mut egui::Ui) {
         egui::Panel::left("navigation")
             .exact_size(230.0)
@@ -1341,20 +1297,17 @@ impl PastVideoApp {
                             .color(SIGNAL),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} FOLDER{}",
-                                self.preferences.folders.len(),
-                                if self.preferences.folders.len() == 1 {
-                                    ""
-                                } else {
-                                    "S"
-                                }
+                        if ui
+                            .small_button("Settings")
+                            .on_hover_text(format!(
+                                "Embedding provider: {}",
+                                self.preferences.embedding.provider.short_label()
                             ))
-                            .monospace()
-                            .size(8.0)
-                            .color(MUTED),
-                        );
+                            .clicked()
+                        {
+                            self.settings_draft = self.preferences.embedding.clone();
+                            self.settings_open = true;
+                        }
                     });
                 });
                 ui.add_space(8.0);
@@ -2646,7 +2599,6 @@ impl eframe::App for PastVideoApp {
         {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
-        self.show_top_bar(root);
         self.show_notice(root);
         self.show_sidebar(root);
         self.show_details(root);
