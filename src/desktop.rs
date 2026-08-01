@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -95,6 +96,7 @@ pub struct PastVideoApp {
     task: Option<TaskKind>,
     searching: bool,
     shared_embedder: Option<SharedEmbedder>,
+    index_cancel: Option<Arc<AtomicBool>>,
     index_progress: Option<IndexProgress>,
     notice: Option<(String, bool)>,
     settings_open: bool,
@@ -132,6 +134,7 @@ impl PastVideoApp {
             task: None,
             searching: false,
             shared_embedder: None,
+            index_cancel: None,
             index_progress: None,
             notice: None,
             settings_open: false,
@@ -243,7 +246,9 @@ impl PastVideoApp {
         let categories_path = self.categories_path(&settings);
         let tx = self.tx.clone();
         let repaint = self.repaint.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
         self.task = Some(TaskKind::Indexing);
+        self.index_cancel = Some(Arc::clone(&cancel));
         self.index_progress = None;
         self.notice = None;
         thread::spawn(move || {
@@ -258,35 +263,43 @@ impl PastVideoApp {
                 let mut live_categories = load_categories(&categories_path);
                 let mut last_completed = 0usize;
                 let report = db
-                    .insert_dir_with_progress(&folder, |progress| {
-                        let completed_file = if progress.files_completed > last_completed {
-                            last_completed = progress.files_completed;
-                            Some(progress.current_file.clone())
-                        } else {
-                            None
-                        };
-                        let _ = tx.send(WorkerMessage::IndexProgress(progress));
-                        repaint.request_repaint();
-                        if let Some(file) = completed_file {
-                            let canonical = file
-                                .canonicalize()
-                                .unwrap_or(file)
-                                .to_string_lossy()
-                                .to_string();
-                            if let Ok(Some(category)) =
-                                semantic_category_for_source(&db, &canonical, &category_embeddings)
-                            {
-                                live_categories.insert(canonical, category);
-                                let _ = save_categories(&categories_path, &live_categories);
-                                let _ = tx.send(WorkerMessage::CategoriesUpdated(
-                                    live_categories.clone(),
-                                ));
-                                repaint.request_repaint();
+                    .insert_dir_with_progress_and_cancel(
+                        &folder,
+                        |progress| {
+                            let completed_file = if progress.files_completed > last_completed {
+                                last_completed = progress.files_completed;
+                                Some(progress.current_file.clone())
+                            } else {
+                                None
+                            };
+                            let _ = tx.send(WorkerMessage::IndexProgress(progress));
+                            repaint.request_repaint();
+                            if let Some(file) = completed_file {
+                                let canonical = file
+                                    .canonicalize()
+                                    .unwrap_or(file)
+                                    .to_string_lossy()
+                                    .to_string();
+                                if let Ok(Some(category)) = semantic_category_for_source(
+                                    &db,
+                                    &canonical,
+                                    &category_embeddings,
+                                ) {
+                                    live_categories.insert(canonical, category);
+                                    let _ = save_categories(&categories_path, &live_categories);
+                                    let _ = tx.send(WorkerMessage::CategoriesUpdated(
+                                        live_categories.clone(),
+                                    ));
+                                    repaint.request_repaint();
+                                }
                             }
-                        }
-                    })
+                        },
+                        || cancel.load(Ordering::Acquire),
+                    )
                     .map_err(|error| error.to_string())?;
-                let categories = if report.new_chunks > 0 || !categories_path.is_file() {
+                let categories = if report.cancelled {
+                    live_categories
+                } else if report.new_chunks > 0 || !categories_path.is_file() {
                     let semantic = if category_embeddings.is_empty() {
                         semantic_categories(&db).unwrap_or_default()
                     } else {
@@ -304,6 +317,21 @@ impl PastVideoApp {
             })();
             let _ = tx.send(WorkerMessage::IndexFinished(result));
         });
+    }
+
+    fn stop_index(&mut self) {
+        if self.task != Some(TaskKind::Indexing) {
+            return;
+        }
+        if let Some(cancel) = self.index_cancel.as_ref() {
+            if !cancel.swap(true, Ordering::AcqRel) {
+                self.notice = Some((
+                    "Stopping indexing after the current safe batch. Indexed moments will be kept."
+                        .into(),
+                    false,
+                ));
+            }
+        }
     }
 
     fn start_search(&mut self) {
@@ -438,19 +466,27 @@ impl PastVideoApp {
                 }
                 WorkerMessage::IndexFinished(result) => {
                     self.task = None;
+                    self.index_cancel = None;
                     self.index_progress = None;
                     match result {
                         Ok(outcome) => {
                             apply_categories(&mut self.videos, &outcome.categories);
-                            self.notice = Some((
+                            let message = if outcome.report.cancelled {
+                                format!(
+                                    "Indexing stopped. Kept {} new moments from {} videos · {} total moments",
+                                    outcome.report.new_chunks,
+                                    outcome.report.files_indexed,
+                                    outcome.report.total_chunks
+                                )
+                            } else {
                                 format!(
                                     "Indexed {} new moments from {} videos · {} total moments",
                                     outcome.report.new_chunks,
                                     outcome.report.files_indexed,
                                     outcome.report.total_chunks
-                                ),
-                                false,
-                            ));
+                                )
+                            };
+                            self.notice = Some((message, false));
                         }
                         Err(error) => self.notice = Some((friendly_error(&error), true)),
                     }
@@ -901,13 +937,21 @@ impl PastVideoApp {
     }
 
     fn show_index_progress(&self, ui: &mut egui::Ui) {
+        let stopping = self
+            .index_cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Acquire));
         let Some(progress) = self.index_progress.as_ref() else {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(
-                    RichText::new("Preparing local index…")
-                        .size(11.0)
-                        .color(SIGNAL),
+                    RichText::new(if stopping {
+                        "Stopping indexing…"
+                    } else {
+                        "Preparing local index…"
+                    })
+                    .size(11.0)
+                    .color(SIGNAL),
                 );
             });
             return;
@@ -926,7 +970,8 @@ impl PastVideoApp {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
-                    "INDEXING  ·  {}/{} VIDEOS  ·  {}/{} MOMENTS",
+                    "{}  ·  {}/{} VIDEOS  ·  {}/{} MOMENTS",
+                    if stopping { "STOPPING" } else { "INDEXING" },
                     progress.files_completed,
                     progress.files_total,
                     progress.chunks_completed,
@@ -970,19 +1015,45 @@ impl PastVideoApp {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if self.videos.is_empty() {
-                    "Index folder".to_string()
+                let indexing = self.task == Some(TaskKind::Indexing);
+                let stopping = self
+                    .index_cancel
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.load(Ordering::Acquire));
+                let label = if stopping {
+                    "Stopping…"
+                } else if indexing {
+                    "■ Stop indexing"
+                } else if self.videos.is_empty() {
+                    "Index folder"
                 } else {
-                    "Index new videos".to_string()
+                    "Index new videos"
                 };
                 if ui
                     .add_enabled(
-                        self.task.is_none() && self.preferences.last_folder.is_some(),
-                        egui::Button::new(RichText::new(label).strong().color(INK)).fill(SIGNAL),
+                        if indexing {
+                            !stopping
+                        } else {
+                            self.task.is_none() && self.preferences.last_folder.is_some()
+                        },
+                        egui::Button::new(RichText::new(label).strong().color(if indexing {
+                            CREAM
+                        } else {
+                            INK
+                        }))
+                        .fill(if indexing {
+                            Color32::from_rgb(120, 47, 35)
+                        } else {
+                            SIGNAL
+                        }),
                     )
                     .clicked()
                 {
-                    self.start_index();
+                    if indexing {
+                        self.stop_index();
+                    } else {
+                        self.start_index();
+                    }
                 }
                 ui.label(
                     RichText::new(format!("{} VIDEOS", indices.len()))

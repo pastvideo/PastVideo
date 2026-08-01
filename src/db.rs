@@ -64,6 +64,7 @@ pub struct IndexReport {
     pub skipped_still: usize,
     pub dlq_chunks: usize,
     pub total_chunks: i64,
+    pub cancelled: bool,
     /// End-to-end embed time for each newly attempted chunk.
     pub embed_ms: Vec<u64>,
 }
@@ -197,13 +198,13 @@ impl Database {
     /// Index a single video file: chunk → preprocess → skip stills → embed →
     /// store. Resumable: already-indexed chunks are skipped.
     pub fn insert_video(&self, path: impl AsRef<Path>) -> Result<IndexReport> {
-        self.insert_paths(vec![path.as_ref().to_path_buf()], &mut |_| {})
+        self.insert_paths(vec![path.as_ref().to_path_buf()], &mut |_| {}, &|| false)
     }
 
     /// Recursively scan `dir` for `.mp4`/`.mov` files and index each.
     pub fn insert_dir(&self, dir: impl AsRef<Path>) -> Result<IndexReport> {
         let videos = scan_directory(dir.as_ref());
-        self.insert_paths(videos, &mut |_| {})
+        self.insert_paths(videos, &mut |_| {}, &|| false)
     }
 
     /// Recursively index a directory while reporting resumable file/chunk
@@ -211,19 +212,37 @@ impl Database {
     pub fn insert_dir_with_progress<F>(
         &self,
         dir: impl AsRef<Path>,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<IndexReport>
     where
         F: FnMut(IndexProgress),
     {
+        self.insert_dir_with_progress_and_cancel(dir, on_progress, || false)
+    }
+
+    /// Recursively index a directory with progress and cooperative
+    /// cancellation. Cancellation is observed between safe embedding batches;
+    /// chunks already committed to the index remain available for search and
+    /// a later run resumes from them.
+    pub fn insert_dir_with_progress_and_cancel<F, C>(
+        &self,
+        dir: impl AsRef<Path>,
+        mut on_progress: F,
+        should_cancel: C,
+    ) -> Result<IndexReport>
+    where
+        F: FnMut(IndexProgress),
+        C: Fn() -> bool,
+    {
         let videos = scan_directory(dir.as_ref());
-        self.insert_paths(videos, &mut on_progress)
+        self.insert_paths(videos, &mut on_progress, &should_cancel)
     }
 
     fn insert_paths(
         &self,
         videos: Vec<PathBuf>,
         on_progress: &mut dyn FnMut(IndexProgress),
+        should_cancel: &dyn Fn() -> bool,
     ) -> Result<IndexReport> {
         let mut report = IndexReport {
             files_scanned: videos.len(),
@@ -243,7 +262,11 @@ impl Database {
         let mut files_completed = 0usize;
         let mut chunks_completed = 0usize;
 
-        for video_path in &videos {
+        'videos: for video_path in &videos {
+            if should_cancel() {
+                report.cancelled = true;
+                break;
+            }
             let abs = match video_path.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
@@ -303,8 +326,13 @@ impl Database {
 
             if self.embedder.supports_video_spans() {
                 let mut file_new = 0usize;
+                let mut cancelled = false;
                 let mut pending = Vec::with_capacity(self.embedder.video_batch_size().max(1));
                 for (start_time, end_time) in &expected_spans {
+                    if should_cancel() {
+                        cancelled = true;
+                        break;
+                    }
                     let chunk_id = make_chunk_id(&abs_str, *start_time);
                     if self.store.has_chunk(&chunk_id)? {
                         chunks_completed += 1;
@@ -354,7 +382,7 @@ impl Database {
                         });
                     }
                 }
-                if !pending.is_empty() {
+                if !cancelled && !pending.is_empty() {
                     let batch_len = pending.len();
                     file_new += self.embed_pending_batch(&pending, &abs_str, &mut report)?;
                     chunks_completed += batch_len;
@@ -370,6 +398,10 @@ impl Database {
                 if file_new > 0 {
                     report.files_indexed += 1;
                     report.new_chunks += file_new;
+                }
+                if cancelled {
+                    report.cancelled = true;
+                    break 'videos;
                 }
                 files_completed += 1;
                 on_progress(IndexProgress {
@@ -406,10 +438,15 @@ impl Database {
             };
 
             let mut file_new = 0usize;
+            let mut cancelled = false;
             let mut files_to_cleanup: Vec<PathBuf> = vec![];
             let mut pending = Vec::with_capacity(self.embedder.video_batch_size().max(1));
 
             for chunk in &chunks {
+                if should_cancel() {
+                    cancelled = true;
+                    break;
+                }
                 let chunk_id = make_chunk_id(&abs_str, chunk.start_time);
 
                 if self.store.has_chunk(&chunk_id)? {
@@ -491,7 +528,7 @@ impl Database {
                 }
             }
 
-            if !pending.is_empty() {
+            if !cancelled && !pending.is_empty() {
                 let batch_len = pending.len();
                 file_new += self.embed_pending_batch(&pending, &abs_str, &mut report)?;
                 chunks_completed += batch_len;
@@ -517,6 +554,10 @@ impl Database {
             if file_new > 0 {
                 report.files_indexed += 1;
                 report.new_chunks += file_new;
+            }
+            if cancelled {
+                report.cancelled = true;
+                break 'videos;
             }
             files_completed += 1;
             on_progress(IndexProgress {

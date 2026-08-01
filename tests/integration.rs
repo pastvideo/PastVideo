@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pastvideo::{default_embedder, Config, Database, DeadLetterQueue, HighlightMethod, VideoSpan};
@@ -299,4 +300,89 @@ fn direct_span_backend_batches_and_reports_live_progress() {
     assert_eq!(last.chunks_completed, 3);
     assert_eq!(last.chunks_total, 3);
     assert_eq!(last.new_chunks, 3);
+}
+
+#[test]
+fn cancellable_index_keeps_completed_batches_and_resumes() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+
+    struct CancellableSpanBackend {
+        request_cancel: Option<Arc<AtomicBool>>,
+    }
+
+    impl pastvideo::Embedder for CancellableSpanBackend {
+        fn embed_video_chunk(&self, _: &Path) -> pastvideo::Result<Vec<f32>> {
+            panic!("direct span backend must not receive temporary clips")
+        }
+        fn video_batch_size(&self) -> usize {
+            1
+        }
+        fn supports_video_spans(&self) -> bool {
+            true
+        }
+        fn embed_video_spans(&self, spans: &[VideoSpan]) -> pastvideo::Result<Vec<Vec<f32>>> {
+            if let Some(cancel) = self.request_cancel.as_ref() {
+                cancel.store(true, Ordering::Release);
+            }
+            Ok(spans.iter().map(|_| vec![1.0]).collect())
+        }
+        fn embed_text(&self, _: &str) -> pastvideo::Result<Vec<f32>> {
+            Ok(vec![1.0])
+        }
+        fn embed_image(&self, _: &Path) -> pastvideo::Result<Vec<f32>> {
+            Ok(vec![1.0])
+        }
+        fn dimensions(&self) -> usize {
+            1
+        }
+        fn backend(&self) -> &str {
+            "cancel-span-test"
+        }
+        fn model(&self) -> &str {
+            "cancel-span-test-v1"
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let video = tmp.path().join("long.mp4");
+    make_color_video(&video, "blue", 70);
+    let db_dir = tmp.path().join("db");
+    let config = Config {
+        chunk_duration: 30.0,
+        overlap: 5.0,
+        skip_still: false,
+        ..Config::default()
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let db = Database::with_config(
+        &db_dir,
+        Box::new(CancellableSpanBackend {
+            request_cancel: Some(Arc::clone(&cancel)),
+        }),
+        config.clone(),
+    )
+    .unwrap();
+    let report = db
+        .insert_dir_with_progress_and_cancel(tmp.path(), |_| {}, || cancel.load(Ordering::Acquire))
+        .unwrap();
+    assert!(report.cancelled);
+    assert_eq!(report.new_chunks, 1);
+    assert_eq!(report.total_chunks, 1);
+    drop(db);
+
+    let db = Database::with_config(
+        &db_dir,
+        Box::new(CancellableSpanBackend {
+            request_cancel: None,
+        }),
+        config,
+    )
+    .unwrap();
+    let resumed = db.insert_video(&video).unwrap();
+    assert!(!resumed.cancelled);
+    assert_eq!(resumed.new_chunks, 2);
+    assert_eq!(resumed.total_chunks, 3);
 }
