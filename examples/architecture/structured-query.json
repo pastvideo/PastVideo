@@ -1,0 +1,16 @@
+{
+  "filters": [
+    {
+      "field": "activity",
+      "op": "eq",
+      "value": "cycling"
+    }
+  ],
+  "sort": [
+    {
+      "field": "confidence",
+      "direction": "desc"
+    }
+  ],
+  "limit": 20
+}

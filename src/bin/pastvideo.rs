@@ -1,13 +1,17 @@
 //! pastvideo CLI — a thin wrapper over the `pastvideo` library [`Database`].
 
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use pastvideo::{
-    benchmark, default_embedder, qwen_embedder, server, Config, Database, HighlightMethod,
+    benchmark, default_embedder, qwen_embedder, server, AnalyzerOutput, Config, Database,
+    FilterPredicate, HighlightMethod, IndexDefinitionSpec, KnowledgeDatabase, StructuredQuery,
 };
 
 #[derive(Parser)]
@@ -138,6 +142,81 @@ enum Command {
     /// Print index statistics.
     Stats,
 
+    /// Register one local video in the durable media catalog.
+    MediaAdd {
+        /// Local video file. Remote URIs and directories are not accepted.
+        path: PathBuf,
+    },
+
+    /// Import completed analyzer outputs as immutable timestamped artifacts.
+    Understand {
+        /// Registered media ID returned by `media-add`.
+        media: String,
+        /// Local JSON file containing an array of AnalyzerOutput objects.
+        manifest: PathBuf,
+        /// Stable retry key. Repeating an identical request reuses its artifacts.
+        #[arg(long)]
+        idempotency_key: String,
+    },
+
+    /// Run local video embedding inference and persist a reusable artifact.
+    UnderstandVideo {
+        /// Registered media ID returned by `media-add`.
+        media: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long, default_value_t = 30.0)]
+        chunk_duration: f64,
+        #[arg(long, default_value_t = 5.0)]
+        overlap: f64,
+        /// Analyze only the first N segments (useful for incremental evaluation).
+        #[arg(long)]
+        max_segments: Option<usize>,
+    },
+
+    /// Inspect an immutable artifact and all of its timestamped records.
+    ArtifactShow { artifact: String },
+
+    /// Build a new physical index version from an existing artifact.
+    IndexCreate {
+        artifact: String,
+        /// Local JSON file containing an IndexDefinitionSpec.
+        definition: PathBuf,
+    },
+
+    /// Atomically activate (or roll back) a logical index alias.
+    IndexActivate { alias: String, version: String },
+
+    /// Search one artifact-backed semantic index or alias.
+    IndexSearch {
+        index: String,
+        query: String,
+        #[arg(short, long, default_value_t = 5)]
+        results: usize,
+        /// Optional local JSON file containing an array of FilterPredicate objects.
+        #[arg(long)]
+        filters: Option<PathBuf>,
+    },
+
+    /// Run a structured query against one artifact-backed index or alias.
+    IndexQuery {
+        index: String,
+        /// Local JSON file containing a StructuredQuery.
+        query: PathBuf,
+    },
+
+    /// Aggregate an enabled field in one artifact-backed index or alias.
+    IndexAggregate {
+        index: String,
+        field: String,
+        /// Optional local JSON file containing an array of FilterPredicate objects.
+        #[arg(long)]
+        filters: Option<PathBuf>,
+    },
+
+    /// Print durable Understanding -> Artifact -> Index object counts.
+    ArchitectureStats,
+
     /// Wipe all indexed chunks.
     Reset,
 
@@ -173,6 +252,7 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Init => {
             let db = open_db(&data_dir, Config::default(), backend)?;
+            KnowledgeDatabase::open(&data_dir).map_err(|error| error.to_string())?;
             println!(
                 "Initialized pastvideo at {} (backend: {}, model: {}).",
                 data_dir.display(),
@@ -337,6 +417,116 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
             }
         }
+        Command::MediaAdd { path } => {
+            let database = open_knowledge_db(&data_dir)?;
+            let media = database
+                .register_local_file(expand(path))
+                .map_err(|error| error.to_string())?;
+            print_json(&media)?;
+        }
+        Command::Understand {
+            media,
+            manifest,
+            idempotency_key,
+        } => {
+            let database = open_knowledge_db(&data_dir)?;
+            let analyzers: Vec<AnalyzerOutput> = read_json(&expand(manifest))?;
+            let result = database
+                .understand(&media, &idempotency_key, &analyzers)
+                .map_err(|error| error.to_string())?;
+            print_json(&result)?;
+        }
+        Command::UnderstandVideo {
+            media,
+            idempotency_key,
+            chunk_duration,
+            overlap,
+            max_segments,
+        } => {
+            let database = open_knowledge_db(&data_dir)?;
+            let embedder = open_embedder(backend)?;
+            let config = pastvideo::VideoEmbeddingAnalyzerConfig {
+                name: "video_embedding".into(),
+                chunk_duration,
+                overlap,
+                max_segments,
+            };
+            let result = database
+                .understand_video_embeddings(&media, &idempotency_key, &config, embedder.as_ref())
+                .map_err(|error| error.to_string())?;
+            print_json(&result)?;
+        }
+        Command::ArtifactShow { artifact } => {
+            let database = open_knowledge_db(&data_dir)?;
+            let info = database
+                .artifact(&artifact)
+                .map_err(|error| error.to_string())?;
+            let records = database
+                .artifact_records(&artifact)
+                .map_err(|error| error.to_string())?;
+            print_json(&serde_json::json!({"artifact": info, "records": records}))?;
+        }
+        Command::IndexCreate {
+            artifact,
+            definition,
+        } => {
+            let database = open_knowledge_db(&data_dir)?;
+            let definition: IndexDefinitionSpec = read_json(&expand(definition))?;
+            let embedder = open_embedder(backend)?;
+            let version = database
+                .build_index(&definition, &artifact, embedder.as_ref())
+                .map_err(|error| error.to_string())?;
+            print_json(&version)?;
+        }
+        Command::IndexActivate { alias, version } => {
+            let database = open_knowledge_db(&data_dir)?;
+            database
+                .activate_alias(&alias, &version)
+                .map_err(|error| error.to_string())?;
+            print_json(
+                &database
+                    .resolve_index(&alias)
+                    .map_err(|error| error.to_string())?,
+            )?;
+        }
+        Command::IndexSearch {
+            index,
+            query,
+            results,
+            filters,
+        } => {
+            let database = open_knowledge_db(&data_dir)?;
+            let filters = read_optional_filters(filters)?;
+            let embedder = open_embedder(backend)?;
+            let hits = database
+                .semantic_search(&index, &query, results, &filters, embedder.as_ref())
+                .map_err(|error| error.to_string())?;
+            print_json(&hits)?;
+        }
+        Command::IndexQuery { index, query } => {
+            let database = open_knowledge_db(&data_dir)?;
+            let query: StructuredQuery = read_json(&expand(query))?;
+            let records = database
+                .structured_query(&index, &query)
+                .map_err(|error| error.to_string())?;
+            print_json(&records)?;
+        }
+        Command::IndexAggregate {
+            index,
+            field,
+            filters,
+        } => {
+            let database = open_knowledge_db(&data_dir)?;
+            let filters = read_optional_filters(filters)?;
+            let buckets = database
+                .aggregate(&index, &field, &filters)
+                .map_err(|error| error.to_string())?;
+            print_json(&buckets)?;
+        }
+        Command::ArchitectureStats => {
+            let database = open_knowledge_db(&data_dir)?;
+            print_json(&database.stats().map_err(|error| error.to_string())?)?;
+        }
         Command::Reset => {
             let db = open_db(&data_dir, Config::default(), backend)?;
             db.reset().map_err(|e| e.to_string())?;
@@ -429,11 +619,37 @@ fn to_match(a: &pastvideo::Anomaly) -> Option<pastvideo::Match> {
 }
 
 fn open_db(data_dir: &PathBuf, cfg: Config, backend: Backend) -> Result<Database, String> {
-    let embedder = match backend {
-        Backend::Baseline => default_embedder(),
-        Backend::Qwen => qwen_embedder().map_err(|error| error.to_string())?,
-    };
+    let embedder = open_embedder(backend)?;
     Database::with_config(data_dir, embedder, cfg).map_err(|e| e.to_string())
+}
+
+fn open_embedder(backend: Backend) -> Result<Box<dyn pastvideo::Embedder>, String> {
+    match backend {
+        Backend::Baseline => Ok(default_embedder()),
+        Backend::Qwen => qwen_embedder().map_err(|error| error.to_string()),
+    }
+}
+
+fn open_knowledge_db(data_dir: &PathBuf) -> Result<KnowledgeDatabase, String> {
+    KnowledgeDatabase::open(data_dir).map_err(|error| error.to_string())
+}
+
+fn read_json<T: DeserializeOwned>(path: &PathBuf) -> Result<T, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid JSON in {}: {error}", path.display()))
+}
+
+fn read_optional_filters(path: Option<PathBuf>) -> Result<Vec<FilterPredicate>, String> {
+    path.map(|path| read_json(&expand(path)))
+        .unwrap_or_else(|| Ok(vec![]))
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
+    let output = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    println!("{output}");
+    Ok(())
 }
 
 fn resolve_data_dir(flag: Option<PathBuf>) -> PathBuf {

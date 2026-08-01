@@ -23,7 +23,7 @@
 //! This is *not* a true cross-modal model. `embed_text` maps color /
 //! brightness / motion keywords heuristically into the same space, so text
 //! search works for concrete queries ("red car", "night", "fast motion") but is
-//! approximate. Swap in a real embedder via the [`Embedder`](super::Embedder)
+//! approximate. Swap in a real embedder via the [`Embedder`]
 //! trait for semantic quality.
 
 use std::path::Path;

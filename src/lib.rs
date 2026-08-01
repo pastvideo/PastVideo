@@ -27,6 +27,7 @@
 //! (frame color/motion features via ffmpeg); real multimodal models can be
 //! implemented against the trait and supplied via [`Database::with_embedder`].
 
+pub mod architecture;
 pub mod benchmark;
 pub mod catalog;
 pub mod chunker;
@@ -43,6 +44,13 @@ pub mod trimmer;
 
 mod db;
 
+pub use architecture::{
+    AggregateBucket, AnalyzerOutput, AnalyzerRunInfo, ArchitectureStats, ArtifactInfo,
+    ArtifactRecord, ArtifactRecordInput, CapabilityReadiness, DerivationInfo, FilterOp,
+    FilterPredicate, IndexDefinitionSpec, IndexVersionInfo, IndexedRecord, KnowledgeDatabase,
+    MediaInfo, SemanticHit, SortDirection, SortSpec, StructuredQuery, UnderstandingResult,
+    UnderstandingRunInfo, VideoEmbeddingAnalyzerConfig,
+};
 pub use db::{Config, Database, IndexProgress, IndexReport, Match};
 pub use dlq::{DeadLetterQueue, DlqEntry};
 pub use embedder::gemini::{GeminiConfig, GeminiEmbedder};

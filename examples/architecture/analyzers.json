@@ -1,0 +1,77 @@
+[
+  {
+    "name": "scene",
+    "analyzer_type": "timestamped_json_import",
+    "model_provider": "local",
+    "model_name": "example-scene-analyzer",
+    "model_revision": "v1",
+    "config": {
+      "source": "local-json"
+    },
+    "artifact_type": "scene",
+    "schema_version": 1,
+    "schema_definition": {
+      "scene_description": "string",
+      "activity": "string",
+      "setting": "string",
+      "camera_motion": "string",
+      "confidence": "number"
+    },
+    "records": [
+      {
+        "segment_id": "scene_0001",
+        "start_ms": 0,
+        "end_ms": 5000,
+        "data": {
+          "scene_description": "A person places a red suitcase into a car trunk.",
+          "activity": "loading luggage",
+          "setting": "parking lot",
+          "camera_motion": "static wide shot",
+          "confidence": 0.91
+        },
+        "metadata": {}
+      },
+      {
+        "segment_id": "scene_0002",
+        "start_ms": 5000,
+        "end_ms": 10000,
+        "data": {
+          "scene_description": "A cyclist rides through a crowded street.",
+          "activity": "cycling",
+          "setting": "urban street",
+          "camera_motion": "tracking shot",
+          "confidence": 0.82
+        },
+        "metadata": {}
+      }
+    ]
+  },
+  {
+    "name": "objects",
+    "analyzer_type": "timestamped_json_import",
+    "model_provider": "local",
+    "model_name": "example-object-detector",
+    "model_revision": "v1",
+    "config": {
+      "confidence_threshold": 0.7
+    },
+    "artifact_type": "objects",
+    "schema_version": 1,
+    "schema_definition": {
+      "label": "string",
+      "confidence": "number"
+    },
+    "records": [
+      {
+        "segment_id": "object_0001",
+        "start_ms": 2000,
+        "end_ms": 6000,
+        "data": {
+          "label": "suitcase",
+          "confidence": 0.94
+        },
+        "metadata": {}
+      }
+    ]
+  }
+]

@@ -1,0 +1,23 @@
+{
+  "name": "scene_semantic",
+  "artifact_type": "scene",
+  "description": "Scene meaning and taxonomy",
+  "semantic_fields": [
+    "scene_description",
+    "activity",
+    "setting"
+  ],
+  "source_embedding_field": null,
+  "filter_fields": [
+    "activity",
+    "setting",
+    "confidence"
+  ],
+  "aggregate_fields": [
+    "activity",
+    "setting"
+  ],
+  "sort_fields": [
+    "confidence"
+  ]
+}

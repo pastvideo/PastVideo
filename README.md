@@ -70,6 +70,11 @@ remote deployments.
 - GPU-backed matched-segment export on supported Windows systems, with safe CPU
   fallback.
 - Local SQLite indexes isolated by embedding provider and model.
+- Immutable, timestamped analyzer artifacts with model/configuration provenance.
+- Multiple logical indexes and immutable physical versions projected from the
+  same artifact without rerunning video understanding.
+- Atomic index aliases for activation and rollback, plus structured filtering,
+  sorting, aggregation, and semantic search.
 - Range-enabled media streaming through the headless HTTP server.
 
 ## Quick start: Desktop (Windows)
@@ -162,6 +167,54 @@ To run the optional browser client and local API together:
 
 Run `pastvideo --help` or `pastvideo <command> --help` for the complete CLI.
 
+## Durable Understanding → Artifact → Index workflow
+
+The original `index` command remains the fastest path from a folder to visual
+search. The artifact-backed commands expose the model-independent database layer
+for integrations that need reproducibility or several query schemas over the
+same model output.
+
+```powershell
+# 1. Register a local file. The command returns a stable media ID as JSON.
+pastvideo --data-dir .tools\knowledge media-add D:\Videos\example.mp4
+
+# 2. Import completed local analyzer outputs as immutable timestamped artifacts.
+pastvideo --data-dir .tools\knowledge understand MEDIA_ID .\analyzers.json `
+  --idempotency-key example-v1
+
+# Or run the installed local video embedding model and persist its vectors.
+pastvideo --data-dir .tools\knowledge --backend qwen understand-video MEDIA_ID `
+  --idempotency-key qwen-video-v1
+
+# 3. Build independent projections from the returned artifact ID.
+pastvideo --data-dir .tools\knowledge index-create ARTIFACT_ID .\scene-semantic.json
+pastvideo --data-dir .tools\knowledge index-create ARTIFACT_ID .\scene-camera.json
+
+# 4. Activate a physical version behind a stable alias and query it.
+pastvideo --data-dir .tools\knowledge index-activate scene_current INDEX_VERSION_ID
+pastvideo --data-dir .tools\knowledge index-search scene_current "red suitcase in a car"
+pastvideo --data-dir .tools\knowledge index-query scene_current .\structured-query.json
+pastvideo --data-dir .tools\knowledge index-aggregate scene_current setting
+```
+
+`analyzers.json` is an array of `AnalyzerOutput` objects. Each output identifies
+the analyzer/model revision and contains records with `segment_id`, `start_ms`,
+`end_ms`, `data`, and `metadata`. `index-create` accepts an
+`IndexDefinitionSpec` JSON object declaring the artifact type and its semantic,
+filter, aggregate, and sort fields. A video-embedding artifact can set
+`source_embedding_field` to `embedding`; its physical indexes then reuse the
+durable vectors without any new video inference. All inputs and media are local
+files in the initial implementation.
+
+Ready-to-edit manifests are provided in
+[`examples/architecture/`](examples/architecture/).
+
+Rows are copied into structured projections before embeddings are generated.
+Completed artifacts and ready index versions are protected by SQLite
+immutability triggers. Idempotency keys reuse identical understanding results,
+and every Media → Understanding → Analyzer → Artifact → Index relationship is
+recorded in the inspectable `derivations` table.
+
 ## Embedding backends
 
 | Backend | Availability | Notes |
@@ -180,18 +233,27 @@ preferences file.
 
 ```mermaid
 flowchart LR
-    F["Video folders"] --> S["Suffix-aware scanner"]
-    S --> C["Overlapping video moments"]
-    C --> E["Local, remote, or Gemini embeddings"]
-    E --> D["SQLite video database"]
-    D --> U["Desktop GUI"]
-    D --> A["CLI and HTTP API"]
+    M["Local media"] --> U["Understanding run"]
+    U --> A["Independent analyzer runs"]
+    A --> R["Immutable timestamped artifacts"]
+    R --> I1["Scene semantic index"]
+    R --> I2["Taxonomy index"]
+    R --> I3["Cinematography index"]
+    I1 --> Q["Aliases and query APIs"]
+    I2 --> Q
+    I3 --> Q
 ```
 
-PastVideo samples overlapping moments from each source file, creates a
-multimodal embedding, and stores the vector with its source path and timestamp.
-Search embeds the query in the same vector space, ranks indexed moments, and
-returns exact time ranges. Source videos are never copied into the database.
+PastVideo separates expensive inference from durable model output and
+rebuildable retrieval indexes. Changing semantic fields, filters, or an
+embedding model builds a new physical version from the existing artifact; it
+does not reopen the video or rerun its analyzer. Search results retain exact
+timestamps and lineage back to the media, model revision, artifact, and index
+version. Source videos are never copied into the database.
+
+The desktop's direct folder-indexing path samples overlapping video moments,
+creates multimodal embeddings, and publishes each completed video immediately.
+It remains available alongside the durable artifact architecture.
 
 The local Qwen pipeline uses batched CUDA inference. For 1080p and larger video,
 it attempts sparse NVIDIA NVDEC sampling and GPU resizing before falling back to
@@ -219,8 +281,10 @@ let saved_clip = db.trim(&hits[0], "clips")?;
 # Ok::<(), pastvideo::Error>(())
 ```
 
-The primary abstraction is `Database`: scanning, chunking, embedding, storage,
-search, and trimming stay behind one Rust API.
+`Database` provides the direct folder-to-search workflow. `KnowledgeDatabase`
+provides media registration, idempotent understanding runs, immutable artifacts,
+multi-index projection, aliases, structured queries, aggregates, and semantic
+search.
 
 ## Local model configuration
 
@@ -245,6 +309,7 @@ speed while preserving enough visual information for retrieval.
 
 ```text
 src/lib.rs                    Core database library
+src/architecture.rs           Durable artifact and multi-index data model
 src/bin/pastvideo.rs          Headless CLI and server entry point
 src/bin/pastvideo_desktop.rs  Native desktop entry point
 src/server.rs                 HTTP API and range-enabled media serving
@@ -267,7 +332,9 @@ npm run build
 ```
 
 The E2E suite covers folder scanning, partial-index search, safe cancellation,
-matched-frame thumbnails, provider contracts, and real FFmpeg clip generation.
+matched-frame thumbnails, provider contracts, real FFmpeg clip generation, and
+the complete local Media → Understanding → Artifact → multiple-index workflow
+through both the Rust API and CLI.
 
 ## Benchmark
 

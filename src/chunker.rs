@@ -378,7 +378,7 @@ pub fn is_still_frame(chunk_path: &Path) -> Result<bool> {
     Ok((max - min) < 0.03)
 }
 
-/// Mean luminance in [0,1] using the BT.601 luma weights.
+/// Mean luminance in `0..=1` using the BT.601 luma weights.
 pub fn mean_luminance(frame: &Frame) -> f64 {
     if frame.rgb.is_empty() {
         return 0.0;

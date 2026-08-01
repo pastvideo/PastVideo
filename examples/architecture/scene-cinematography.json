@@ -1,0 +1,16 @@
+{
+  "name": "scene_cinematography",
+  "artifact_type": "scene",
+  "description": "Camera-language projection of the same scene artifact",
+  "semantic_fields": [
+    "camera_motion"
+  ],
+  "source_embedding_field": null,
+  "filter_fields": [
+    "camera_motion"
+  ],
+  "aggregate_fields": [
+    "camera_motion"
+  ],
+  "sort_fields": []
+}
