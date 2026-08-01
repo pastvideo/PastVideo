@@ -71,13 +71,24 @@ impl DeadLetterQueue {
              ON CONFLICT(id) DO UPDATE SET
                error=excluded.error, attempts=excluded.attempts,
                last_attempt=excluded.last_attempt",
-            params![id, source_file, start_time, end_time, trimmed, attempts as i64, now],
+            params![
+                id,
+                source_file,
+                start_time,
+                end_time,
+                trimmed,
+                attempts as i64,
+                now
+            ],
         )?;
         Ok(())
     }
 
     pub fn remove(&self, id: &str) -> Result<bool> {
-        Ok(self.conn.execute("DELETE FROM dlq WHERE id=?1", params![id])? > 0)
+        Ok(self
+            .conn
+            .execute("DELETE FROM dlq WHERE id=?1", params![id])?
+            > 0)
     }
 
     pub fn clear(&self) -> Result<usize> {
@@ -110,8 +121,7 @@ impl DeadLetterQueue {
     pub fn len(&self) -> Result<usize> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM dlq", [], |r| r.get::<_, i64>(0))?
-            as usize)
+            .query_row("SELECT COUNT(*) FROM dlq", [], |r| r.get::<_, i64>(0))? as usize)
     }
 
     pub fn is_empty(&self) -> Result<bool> {

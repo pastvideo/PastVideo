@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::chunker::{
     chunk_video, expected_chunk_spans, is_still_frame, preprocess_chunk, scan_directory,
@@ -17,7 +17,7 @@ use crate::chunker::{
 use crate::dlq::{DeadLetterQueue, DlqEntry};
 use crate::embedder::{default_embedder, Embedder};
 use crate::error::{is_permanent_failure, Error, Result};
-use crate::highlights::{rank_highlights, AgainstMode, Method as HighlightMethod, Anomaly};
+use crate::highlights::{rank_highlights, AgainstMode, Anomaly, Method as HighlightMethod};
 use crate::search::search_with_embedding;
 use crate::store::{make_chunk_id, Hit, MetaKey, SentryStore, Stats};
 use crate::trimmer::{trim_clip, DEFAULT_PADDING};
@@ -63,6 +63,8 @@ pub struct IndexReport {
     pub skipped_still: usize,
     pub dlq_chunks: usize,
     pub total_chunks: i64,
+    /// End-to-end embed time for each newly attempted chunk.
+    pub embed_ms: Vec<u64>,
 }
 
 /// A ranked search match.
@@ -201,8 +203,14 @@ impl Database {
                     if !cfg.retry_failed && self.dlq.contains(&id).unwrap_or(false) {
                         continue;
                     }
-                    self.dlq
-                        .record(&id, &video_path.to_string_lossy(), 0.0, 0.0, "file not found", 1)?;
+                    self.dlq.record(
+                        &id,
+                        &video_path.to_string_lossy(),
+                        0.0,
+                        0.0,
+                        "file not found",
+                        1,
+                    )?;
                     report.dlq_chunks += 1;
                     continue;
                 }
@@ -233,7 +241,8 @@ impl Database {
                 Err(e) => {
                     // Whole-file failure → record one DLQ entry and move on.
                     let id = make_chunk_id(&abs_str, 0.0);
-                    self.dlq.record(&id, &abs_str, 0.0, 0.0, &e.to_string(), 1)?;
+                    self.dlq
+                        .record(&id, &abs_str, 0.0, 0.0, &e.to_string(), 1)?;
                     report.dlq_chunks += 1;
                     continue;
                 }
@@ -273,8 +282,20 @@ impl Database {
                     chunk.path.clone()
                 };
 
-                match self.embed_with_retry(&embed_path, &chunk_id, &abs_str, chunk.start_time, chunk.end_time)? {
+                let embed_started = Instant::now();
+                let embedded = self.embed_with_retry(
+                    &embed_path,
+                    &chunk_id,
+                    &abs_str,
+                    chunk.start_time,
+                    chunk.end_time,
+                )?;
+                report
+                    .embed_ms
+                    .push(embed_started.elapsed().as_millis() as u64);
+                match embedded {
                     Some(embedding) => {
+                        self.validate_embedding(&embedding)?;
                         self.store.add_chunk(
                             &chunk_id,
                             &embedding,
@@ -356,6 +377,7 @@ impl Database {
         dedupe: Option<f64>,
     ) -> Result<Vec<Match>> {
         let emb = self.embedder.embed_text(query)?;
+        self.validate_embedding(&emb)?;
         self.search_embedding(&emb, n_results, dedupe)
     }
 
@@ -367,6 +389,7 @@ impl Database {
         dedupe: Option<f64>,
     ) -> Result<Vec<Match>> {
         let emb = self.embedder.embed_image(image.as_ref())?;
+        self.validate_embedding(&emb)?;
         self.search_embedding(&emb, n_results, dedupe)
     }
 
@@ -410,9 +433,11 @@ impl Database {
             .and_then(|s| s.to_str())
             .unwrap_or("clip")
             .to_string();
-        let out = output_dir
-            .as_ref()
-            .join(format!("match_{basename}_{}-{}.mp4", fmt_t(m.start_time), fmt_t(m.end_time)));
+        let out = output_dir.as_ref().join(format!(
+            "match_{basename}_{}-{}.mp4",
+            fmt_t(m.start_time),
+            fmt_t(m.end_time)
+        ));
         trim_clip(source, m.start_time, m.end_time, &out, DEFAULT_PADDING)
     }
 
@@ -437,6 +462,24 @@ impl Database {
 
     pub fn dlq_clear(&self) -> Result<usize> {
         self.dlq.clear()
+    }
+
+    fn validate_embedding(&self, embedding: &[f32]) -> Result<()> {
+        let expected = self.embedder.dimensions();
+        if embedding.len() != expected {
+            return Err(Error::Embed(format!(
+                "backend '{}' returned {} dimensions; expected {expected}",
+                self.embedder.backend(),
+                embedding.len()
+            )));
+        }
+        if embedding.iter().any(|value| !value.is_finite()) {
+            return Err(Error::Embed(format!(
+                "backend '{}' returned a non-finite embedding",
+                self.embedder.backend()
+            )));
+        }
+        Ok(())
     }
 }
 

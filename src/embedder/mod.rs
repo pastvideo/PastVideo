@@ -7,6 +7,7 @@
 //! dropped in via [`Database::with_embedder`](crate::Database::with_embedder).
 
 pub mod baseline;
+pub mod qwen;
 
 use std::path::Path;
 
@@ -42,4 +43,9 @@ pub trait Embedder: Send + Sync {
 /// The default offline embedder, boxed for convenience.
 pub fn default_embedder() -> Box<dyn Embedder> {
     Box::new(baseline::BaselineEmbedder::new())
+}
+
+/// The official local Qwen3-VL multimodal retrieval backend.
+pub fn qwen_embedder() -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(qwen::QwenEmbedder::from_env()?))
 }

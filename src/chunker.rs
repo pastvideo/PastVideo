@@ -43,15 +43,41 @@ pub struct Chunk {
 
 /// Locate `ffmpeg` on `PATH`. Errors if not found.
 pub fn find_ffmpeg() -> Result<PathBuf> {
-    which("ffmpeg")
+    find_program("ffmpeg", "PASTVIDEO_FFMPEG")
         .into_iter()
         .next()
-        .ok_or_else(|| Error::Ffmpeg("ffmpeg not found on PATH. Install ffmpeg (e.g. `brew install ffmpeg`).".into()))
+        .ok_or_else(|| {
+            Error::Ffmpeg(
+                "ffmpeg not found on PATH. Install ffmpeg (e.g. `brew install ffmpeg`).".into(),
+            )
+        })
 }
 
 /// Locate `ffprobe` on `PATH`, if present (optional — used for fast probing).
 pub fn find_ffprobe() -> Option<PathBuf> {
-    which("ffprobe").into_iter().next()
+    find_program("ffprobe", "PASTVIDEO_FFPROBE")
+        .into_iter()
+        .next()
+}
+
+fn find_program(prog: &str, override_var: &str) -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os(override_var).map(PathBuf::from) {
+        if path.is_file() {
+            return vec![path];
+        }
+    }
+    let bundled_name = if cfg!(windows) {
+        format!("{prog}.exe")
+    } else {
+        prog.to_owned()
+    };
+    let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".tools/ffmpeg/bin")
+        .join(bundled_name);
+    if bundled.is_file() {
+        return vec![bundled];
+    }
+    which(prog)
 }
 
 /// Tiny PATH search so we avoid pulling in the `which` crate.
@@ -62,9 +88,16 @@ fn which(prog: &str) -> Vec<PathBuf> {
     };
     let mut hits = vec![];
     for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(prog);
-        if candidate.is_file() {
-            hits.push(candidate);
+        let names = if cfg!(windows) {
+            vec![prog.to_owned(), format!("{prog}.exe")]
+        } else {
+            vec![prog.to_owned()]
+        };
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                hits.push(candidate);
+            }
         }
     }
     hits
@@ -104,14 +137,22 @@ pub fn video_duration(path: &Path) -> Result<f64> {
 fn parse_duration_stderr(stderr: &str) -> Result<f64> {
     for line in stderr.lines() {
         if let Some(rest) = line.trim().strip_prefix("Duration:") {
-            let token = rest.split_whitespace().next().unwrap_or("").trim_end_matches(',');
+            let token = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(',');
             return parse_hms(token)
                 .ok_or_else(|| Error::Ffmpeg(format!("could not parse duration line: {line}")));
         }
         // ffmpeg sometimes prints "  Duration: ..." mid-line
         if let Some(idx) = line.find("Duration:") {
             let rest = &line[idx + "Duration:".len()..];
-            let token = rest.split_whitespace().next().unwrap_or("").trim_end_matches(',');
+            let token = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(',');
             if let Some(d) = parse_hms(token) {
                 return Ok(d);
             }
@@ -179,11 +220,7 @@ pub fn expected_chunk_spans(
 ///
 /// The caller is responsible for cleaning up the temp directory the chunks
 /// live in (returned via [`Chunk::path`]'s parent, or use [`Chunk::tmp_dir`]).
-pub fn chunk_video(
-    video_path: &Path,
-    chunk_duration: f64,
-    overlap: f64,
-) -> Result<Vec<Chunk>> {
+pub fn chunk_video(video_path: &Path, chunk_duration: f64, overlap: f64) -> Result<Vec<Chunk>> {
     let abs = video_path
         .canonicalize()
         .map_err(|e| Error::NotFound(format!("{}: {e}", video_path.display())))?;
@@ -237,17 +274,21 @@ impl Chunk {
 
 /// Downscale and reduce frame rate of a chunk for cheaper embedding.
 /// Returns the path to the preprocessed file (or the original on failure).
-pub fn preprocess_chunk(chunk_path: &Path, target_resolution: u32, target_fps: u32) -> Result<PathBuf> {
+pub fn preprocess_chunk(
+    chunk_path: &Path,
+    target_resolution: u32,
+    target_fps: u32,
+) -> Result<PathBuf> {
     let ffmpeg = find_ffmpeg()?;
     let out_path = with_suffix(chunk_path, "_preprocessed");
     let out = Command::new(&ffmpeg)
         .args(["-y", "-i"])
         .arg(chunk_path)
-        .args([
-            "-vf",
-        ])
+        .args(["-vf"])
         .arg(format!("scale=-2:{target_resolution},fps={target_fps}"))
-        .args(["-c:v", "libx264", "-crf", "28", "-c:a", "aac", "-b:a", "64k"])
+        .args([
+            "-c:v", "libx264", "-crf", "28", "-c:a", "aac", "-b:a", "64k",
+        ])
         .arg(&out_path)
         .output()
         .map_err(|e| Error::Ffmpeg(format!("ffmpeg preprocess failed: {e}")))?;
@@ -316,12 +357,7 @@ pub fn mean_luminance(frame: &Frame) -> f64 {
 
 /// Extract `n` evenly-spaced frames from `path` as raw RGB24, each scaled to
 /// `width`×`height`. Seeks with `-ss` before `-i` for speed.
-pub fn extract_frames(
-    path: &Path,
-    n: usize,
-    width: usize,
-    height: usize,
-) -> Result<Vec<Frame>> {
+pub fn extract_frames(path: &Path, n: usize, width: usize, height: usize) -> Result<Vec<Frame>> {
     let ffmpeg = find_ffmpeg()?;
     let duration = video_duration(path).unwrap_or(0.0).max(0.0);
     let frame_bytes = width * height * 3;

@@ -27,12 +27,14 @@
 //! (frame color/motion features via ffmpeg); real multimodal models can be
 //! implemented against the trait and supplied via [`Database::with_embedder`].
 
+pub mod benchmark;
 pub mod chunker;
 pub mod dlq;
 pub mod embedder;
 pub mod error;
 pub mod highlights;
 pub mod search;
+pub mod server;
 pub mod store;
 pub mod trimmer;
 
@@ -40,7 +42,8 @@ mod db;
 
 pub use db::{Config, Database, IndexReport, Match};
 pub use dlq::{DeadLetterQueue, DlqEntry};
-pub use embedder::{default_embedder, Embedder};
+pub use embedder::qwen::{QwenConfig, QwenEmbedder};
+pub use embedder::{default_embedder, qwen_embedder, Embedder};
 pub use error::{Error, Result};
 pub use highlights::{AgainstMode, Anomaly, Method as HighlightMethod};
 pub use store::{make_chunk_id, Hit, Stats};

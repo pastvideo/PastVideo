@@ -29,8 +29,8 @@
 use std::path::Path;
 
 use crate::chunker::{self, Frame, FRAME_H, FRAME_SAMPLES, FRAME_W};
-use crate::error::{Error, Result};
 use crate::embedder::Embedder;
+use crate::error::{Error, Result};
 
 pub const BACKEND: &str = "baseline";
 pub const MODEL: &str = "baseline-v1";
@@ -284,8 +284,14 @@ pub fn features_from_query(query: &str) -> Vec<f32> {
 
     // --- brightness block (only if a brightness word is present) ---
     let mut bright = vec![0.0_f32; BRIGHT_BINS];
-    let dark = has_any(&tokens, &["dark", "black", "night", "dim", "shadow", "shadowy"]);
-    let bright_w = has_any(&tokens, &["bright", "white", "light", "day", "sunny", "daytime"]);
+    let dark = has_any(
+        &tokens,
+        &["dark", "black", "night", "dim", "shadow", "shadowy"],
+    );
+    let bright_w = has_any(
+        &tokens,
+        &["bright", "white", "light", "day", "sunny", "daytime"],
+    );
     if dark {
         bump_1d(&mut bright, 0);
     }
@@ -298,7 +304,9 @@ pub fn features_from_query(query: &str) -> Vec<f32> {
     let mut motion = vec![0.0_f32; MOTION_BINS];
     let fast = has_any(
         &tokens,
-        &["moving", "move", "fast", "running", "run", "driving", "drive", "action", "motion"],
+        &[
+            "moving", "move", "fast", "running", "run", "driving", "drive", "action", "motion",
+        ],
     );
     let still = has_any(
         &tokens,
@@ -326,7 +334,14 @@ pub fn features_from_query(query: &str) -> Vec<f32> {
 fn add_color_bump(hist: &mut [f32], r: usize, g: usize, b: usize) {
     let center = r * 16 + g * 4 + b;
     hist[center] += 1.0;
-    for &(dr, dg, db) in &[(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+    for &(dr, dg, db) in &[
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 1, 0),
+        (0, -1, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+    ] {
         let nr = (r as isize + dr) as usize;
         let ng = (g as isize + dg) as usize;
         let nb = (b as isize + db) as usize;

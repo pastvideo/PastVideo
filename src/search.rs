@@ -62,7 +62,11 @@ pub fn dedupe_indices(
 }
 
 fn normalize_f64(v: &[f32]) -> Vec<f64> {
-    let norm: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+    let norm: f64 = v
+        .iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        .sqrt();
     let n = if norm > 1e-12 { norm } else { 1.0 };
     v.iter().map(|&x| x as f64 / n).collect()
 }

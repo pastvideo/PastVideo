@@ -1,135 +1,171 @@
-# pastvideo
+# PastVideo
 
-A Rust **video-search database**. Index footage, then search it by natural
-language or reference image. The entire pipeline — chunk → preprocess → skip
-stills → embed → store → search → trim — runs **inside** the database, behind a
-simple insert/query API.
+PastVideo is a local semantic video-search database. It chunks footage, embeds
+each moment, stores vectors in SQLite, searches by natural language or an image,
+and trims the selected result. The real retrieval backend is the official
+[`Qwen/Qwen3-VL-Embedding-2B`](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B)
+checkpoint running on CUDA; no API key or footage upload is involved.
 
-Inspired by [sentrysearch](https://github.com/ssrajadh/sentrysearch), rewritten
-in Rust as a single embedded library + CLI.
+This implementation turns
+[sentrysearch issue #68](https://github.com/ssrajadh/sentrysearch/issues/68)
+into a reproducible benchmark and an interactive local application.
 
-## How it works
+## Try the web app
 
-1. **Chunk** — a video is split into overlapping segments (default 30 s + 5 s
-   overlap) with ffmpeg.
-2. **Preprocess** — each chunk is downscaled to 480 p @ 5 fps (a big reduction
-   in pixels to process).
-3. **Skip stills** — chunks with no meaningful visual change are skipped.
-4. **Embed** — each chunk becomes a fixed-dimension vector via an
-   [`Embedder`](src/embedder/mod.rs).
-5. **Store** — vectors + metadata land in a local SQLite database.
-6. **Search** — a text or image query is embedded into the same space and
-   ranked by cosine similarity; the top match is trimmed from the source.
+On Windows PowerShell:
 
-## Quick start (library)
-
-```rust
-use pastvideo::{Database, HighlightMethod};
-
-let mut db = Database::open("~/.pastvideo")?;
-
-// INSERT — the DB runs the whole pipeline internally.
-db.insert_dir("footage/")?;
-
-// QUERY — the DB embeds + ranks internally.
-let hits = db.search_text("red truck", 5, None)?;
-for m in &hits {
-    println!("[{:.2}] {} @ {:.0}-{:.0}", m.score, m.source_file, m.start_time, m.end_time);
-}
-
-let by_image = db.search_image("ref.jpg", 5, None)?;
-let weird    = db.highlights(3, HighlightMethod::Knn, 10, 0.9, false)?;
-let clip     = db.trim(&hits[0], "clips/")?;
+```powershell
+.\scripts\run_web.ps1
 ```
 
-`Database` is configured through [`Config`](src/db.rs):
+The first run creates a shared CUDA environment at
+`%USERPROFILE%\.venvs\qwen3-vl-cu128`, downloads the official 2B model to the
+user cache, downloads the issue #68 sample clip if needed, indexes it, starts the
+Rust API, and opens the UI at `http://localhost:3001`.
 
-| field | default | meaning |
-|---|---|---|
-| `chunk_duration` | 30.0 | seconds per chunk |
-| `overlap` | 5.0 | overlap between chunks |
-| `preprocess` | true | downscale/reduce fps before embedding |
-| `target_resolution` | 480 | target height in pixels |
-| `target_fps` | 5 | target frame rate |
-| `skip_still` | true | skip chunks with no visual change |
-| `retry_failed` | false | re-attempt DLQ'd chunks |
+To search your own video from a clean data directory:
+
+```powershell
+.\scripts\run_web.ps1 -DataDir .tools\my-index -Video D:\footage\drive.mp4
+```
+
+The browser talks to a local Rust API on `127.0.0.1:8787`. Source videos are
+served with byte-range support for accurate seeking, and **Save clip** invokes
+the real ffmpeg trimming path.
+
+## Reproduce issue #68
+
+Install the reusable model environment once:
+
+```powershell
+.\scripts\setup_qwen.ps1
+```
+
+Then run the benchmark:
+
+```powershell
+cargo run --release -- --data-dir .tools\benchmark-data benchmark `
+  --output .tools\qwen-benchmark.md
+```
+
+The command detects hardware, downloads and validates the fixed 147 MB clip,
+indexes 30-second windows with 5-second overlap, executes all 13 fixed text
+queries from the issue, and writes a Markdown report.
+
+Measured on this development machine (RTX 4090 D, Ryzen 7 9700X, 64 GB RAM):
+
+- 76 video moments indexed
+- 0.46 s mean embedding time per moment (0.72 s standard deviation)
+- 6,747 MiB observed peak GPU memory
+- about 48 seconds benchmark time excluding the first download
+- all 13 fixed queries completed successfully
+
+For example, `amazon prime van` ranks the 23:20–23:50 interval first with a
+cosine score of 0.7222. The generated report remains at
+`.tools/qwen-benchmark.md` locally because benchmark media and model artifacts
+are intentionally gitignored.
 
 ## CLI
 
-```bash
-cargo run --release -- init
-cargo run --release -- index /path/to/footage
-cargo run --release -- search "car running a red light"
-cargo run --release -- img reference.jpg
-cargo run --release -- highlights --method knn
-cargo run --release -- stats
-cargo run --release -- dlq list
+```powershell
+# Index and search with the real local model
+cargo run --release -- --data-dir .tools\my-index --backend qwen index D:\footage
+cargo run --release -- --data-dir .tools\my-index --backend qwen search "black SUV"
+
+# Start only the API for an existing index
+cargo run --release -- --data-dir .tools\my-index --backend qwen serve
+
+# Inspect the index
+cargo run --release -- --data-dir .tools\my-index --backend qwen stats
 ```
 
-`--data-dir DIR` overrides the database location (default `~/.pastvideo` or
-`$PASTVIDEO_HOME`). `--dedupe 0.9` drops near-duplicate results.
+The lightweight handcrafted `baseline` backend is still available for CPU-only
+tests, but it is not a general semantic model. Use `--backend qwen` for the real
+cross-modal pipeline.
 
-## The embedder
-
-Embeddings are produced by a pluggable [`Embedder`](src/embedder/mod.rs) trait.
-The default **`BaselineEmbedder`** runs fully **offline** — no API key, no model
-download, no GPU. It extracts up to 8 frames per chunk via ffmpeg and builds a
-124-dimension feature vector from four histogram blocks, each unit-normalized
-so cosine similarity compares *patterns*:
-
-- **Color histogram** (4×4×4 RGB bins) — hue distribution.
-- **Spatial grid** (4×4 cells × RGB) — coarse layout.
-- **Brightness histogram** (8 luma bins) — so `dark` ↔ `bright` discriminate.
-- **Motion histogram** (4 inter-frame-change bins) — so `still` ↔ `fast` discriminate.
-
-…then L2-normalizes the whole vector. Image and text queries map into the same
-space (text uses a color/brightness/motion keyword heuristic). This makes
-similarity / image search and concrete text queries ("red car", "night",
-"fast motion") work, but it is **not a true cross-modal model**.
-
-To use a real model, implement `Embedder` and open with it:
+## Library
 
 ```rust
-let db = Database::with_embedder("~/.pastvideo", my_gemini_embedder)?;
+use pastvideo::{qwen_embedder, Database};
+
+let db = Database::with_embedder(".pastvideo", qwen_embedder()?)?;
+db.insert_video("footage/front.mp4")?;
+
+let hits = db.search_text("a delivery van in traffic", 5, Some(0.98))?;
+let clip = db.trim(&hits[0], "clips")?;
+# Ok::<(), pastvideo::Error>(())
 ```
 
-A Gemini 2 / local Qwen3-VL embedder can be implemented against the trait and
-slotted in without touching the rest of the pipeline. Backends/models are
-isolated: a query embedder is rejected if it doesn't match the indexed one.
+The pipeline lives behind `Database`: chunk → preprocess → still detection →
+embed → store → search → trim. Backend and model identifiers are stored with the
+index, so incompatible vectors cannot be mixed accidentally.
 
-## Storage
+## Local model and runtime
 
-A single SQLite file (`pastvideo.db`) holds chunks (embedding as a
-little-endian f32 BLOB), metadata, and the dead-letter queue. Search is
-brute-force cosine — simple and correct for moderate indexes.
+The default Qwen locations are:
+
+- Python: `%USERPROFILE%\.venvs\qwen3-vl-cu128\Scripts\python.exe`
+- Model: `%USERPROFILE%\.cache\pastvideo\models\Qwen3-VL-Embedding-2B-modelscope`
+- Worker: `python\qwen_worker.py`
+
+Override them with `PASTVIDEO_QWEN_PYTHON`, `PASTVIDEO_QWEN_MODEL`, and
+`PASTVIDEO_QWEN_WORKER`. `PASTVIDEO_QWEN_MAX_FRAMES` controls frames sampled per
+video chunk (default 16).
+
+The setup script prefers an existing CUDA-enabled PyTorch wheel from the local
+uv cache, otherwise installs the common CUDA 12.8 PyTorch toolset into the shared
+user environment. That environment is deliberately outside this repository so
+other local projects can reuse it.
 
 ## Requirements
 
-- Rust (edition 2021).
-- `ffmpeg` (and ideally `ffprobe`) on PATH.
-- No network, no API key, no GPU required for the default backend.
+- Windows PowerShell and Rust (edition 2021)
+- Node.js 22+ for the web UI
+- NVIDIA GPU with roughly 8 GB or more free VRAM for the Qwen backend
+- Internet access for the first model and benchmark download
 
-## Project layout
+A project-local ffmpeg build is used automatically when present at
+`.tools\ffmpeg\bin`; `PASTVIDEO_FFMPEG` and `PASTVIDEO_FFPROBE` can override it.
 
-```
-src/
-├── lib.rs            public API
-├── db.rs             Database — orchestrates the whole pipeline
-├── chunker.rs        ffmpeg: chunk / preprocess / still-detect / frame extract
-├── embedder/         Embedder trait + offline BaselineEmbedder
-├── store.rs          SQLite vector store + brute-force cosine
-├── search.rs         search + near-duplicate dedupe
-├── highlights.rs     anomaly scoring (centroid / knn / lof)
-├── trimmer.rs        ffmpeg clip extraction
-├── dlq.rs            dead-letter queue
-└── bin/pastvideo.rs  CLI
+## Verification
+
+```powershell
+cargo test
+cargo clippy --all-targets -- -D warnings
+cd web
+npm run lint
+npm run build
 ```
 
-## Future work
+## Hosted demo
 
-- True cross-modal embeddings (Gemini / local Qwen3-VL) via the trait.
-- ANN index (HNSW) instead of brute-force cosine.
-- VLM `--rerank`, Tesla telemetry overlay, SentryMerge/SentryBlur handoffs.
+The live demo is served at
+[`https://moni.claw9d.com/pastvideo_demo/`](https://moni.claw9d.com/pastvideo_demo/).
+The web service runs on `claw9d.com`, while semantic search and media are carried
+through a reverse SSH tunnel to this Windows GPU workstation. The public demo is
+therefore available only while this workstation is online and both scheduled
+tasks are running:
+
+```powershell
+Get-ScheduledTask "PastVideo Hosted API", "PastVideo Hosted Tunnel"
+Start-ScheduledTask "PastVideo Hosted API", "PastVideo Hosted Tunnel"
+Stop-ScheduledTask "PastVideo Hosted API", "PastVideo Hosted Tunnel"
+```
+
+Install or refresh the startup tasks with
+`powershell -ExecutionPolicy Bypass -File scripts\install_hosted_tasks.ps1`.
+Local logs are written under `.tools\hosted-*.log` and `.tools\hosted-*.err`.
+The static web release is stored under
+`/home/flowbehappy/apps/pastvideo_demo/current`; nginx serves it directly. The
+nginx site file is `/etc/nginx/sites-available/moni.claw9d.com`, and deployment
+creates a timestamped backup beside it before modification.
+
+To roll back, restore that nginx backup and reload nginx, remove the static
+release symlink if desired, and unregister the two Windows tasks:
+
+```powershell
+Unregister-ScheduledTask "PastVideo Hosted API", "PastVideo Hosted Tunnel" -Confirm:$false
+```
 
 ## License
 

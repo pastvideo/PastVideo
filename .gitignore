@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target/
 
+# Local Qwen/Python and media tool runtimes
+/.venv-qwen/
+/.tools/
+
 # SQLite runtime databases
 *.db
 *.db-shm

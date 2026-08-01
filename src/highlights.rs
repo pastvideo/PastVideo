@@ -73,7 +73,11 @@ pub fn rank_highlights(
         if matches!(against_mode, AgainstMode::Within) {
             let pool = 50usize.max(count).min(n);
             let mut order: Vec<usize> = (0..n).collect();
-            order.sort_unstable_by(|&a, &b| sims[b].partial_cmp(&sims[a]).unwrap_or(std::cmp::Ordering::Equal));
+            order.sort_unstable_by(|&a, &b| {
+                sims[b]
+                    .partial_cmp(&sims[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             mask.fill(false);
             for &i in order.iter().take(pool) {
                 mask[i] = true;
@@ -106,7 +110,10 @@ pub fn rank_highlights(
     let mut final_scores = scores_sub;
     if let (Some(sims), AgainstMode::Global) = (&query_sim, against_mode) {
         let min = final_scores.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = final_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let max = final_scores
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         let range = (max - min).max(1e-12);
         for (j, &ci) in cand_idx.iter().enumerate() {
             let norm_s = (final_scores[j] - min) / range;
@@ -117,7 +124,9 @@ pub fn rank_highlights(
     // Best-first order over global indices.
     let mut order: Vec<usize> = (0..cand_idx.len()).collect();
     order.sort_unstable_by(|&a, &b| {
-        final_scores[b].partial_cmp(&final_scores[a]).unwrap_or(std::cmp::Ordering::Equal)
+        final_scores[b]
+            .partial_cmp(&final_scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     let ranked_global: Vec<usize> = order.iter().map(|&j| cand_idx[j]).collect();
 
@@ -187,7 +196,9 @@ fn score_lof(xn: &[Vec<f64>], k: usize) -> Vec<f64> {
         .map(|i| {
             let mut idx: Vec<usize> = (0..n).collect();
             idx.sort_unstable_by(|&a, &b| {
-                dist[i][a].partial_cmp(&dist[i][b]).unwrap_or(std::cmp::Ordering::Equal)
+                dist[i][a]
+                    .partial_cmp(&dist[i][b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             idx.into_iter().take(k).collect::<Vec<_>>()
         })
@@ -302,9 +313,18 @@ mod tests {
             row(&[0.98, 0.02, 0.0]),
             row(&[0.0, 1.0, 0.0]), // outlier
         ];
-        let h = rank_highlights(&rows, 4, Method::Centroid, 2, 1.0, false, None, AgainstMode::Within);
+        let h = rank_highlights(
+            &rows,
+            4,
+            Method::Centroid,
+            2,
+            1.0,
+            false,
+            None,
+            AgainstMode::Within,
+        );
         assert_eq!(h[0].source_file, ""); // best is the green outlier row
-        // the green row's embedding distance from the red centroid is largest
+                                          // the green row's embedding distance from the red centroid is largest
         assert!(h[0].score > h[1].score);
     }
 }

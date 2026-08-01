@@ -35,7 +35,17 @@ fn make_color_video(path: &Path, color: &str, secs: u32) {
 fn make_color_image(path: &Path, color: &str) {
     let src = format!("color=c={color}:s=64x48:d=1");
     let status = Command::new("ffmpeg")
-        .args(["-y", "-f", "lavfi", "-i", &src, "-frames:v", "1", "-update", "1"])
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &src,
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+        ])
         .arg(path)
         .status()
         .expect("ffmpeg runs");
@@ -69,12 +79,7 @@ fn end_to_end_index_search_trim() {
         preprocess: false,
         ..Config::default()
     };
-    let db = Database::with_config(
-        tmp.path().join("db"),
-        default_embedder(),
-        cfg,
-    )
-    .unwrap();
+    let db = Database::with_config(tmp.path().join("db"), default_embedder(), cfg).unwrap();
 
     let r1 = db.insert_video(&red).unwrap();
     let r2 = db.insert_video(&green).unwrap();
@@ -142,7 +147,10 @@ fn still_frame_skipped_by_default() {
     let db = Database::open(tmp.path().join("db")).unwrap(); // default: skip_still = true
     let report = db.insert_video(&red).unwrap();
     assert_eq!(report.new_chunks, 0, "solid-color chunk should be skipped");
-    assert!(report.skipped_still >= 1, "should record a skipped still chunk");
+    assert!(
+        report.skipped_still >= 1,
+        "should record a skipped still chunk"
+    );
 }
 
 #[test]
@@ -179,16 +187,21 @@ fn backend_mismatch_is_rejected() {
     use pastvideo::store::{make_chunk_id, SentryStore};
     let store = SentryStore::open(&tmp.path().join("db").join("pastvideo.db")).unwrap();
     store
-        .add_chunk("x", &[0.0], "/a.mp4", 0.0, 1.0, "baseline", Some("baseline-v1"))
+        .add_chunk(
+            "x",
+            &[0.0],
+            "/a.mp4",
+            0.0,
+            1.0,
+            "baseline",
+            Some("baseline-v1"),
+        )
         .unwrap();
     drop(store);
     drop(db);
 
     let _ = make_chunk_id; // keep import used
-    let result = Database::with_embedder(
-        tmp.path().join("db"),
-        Box::new(OtherBackend),
-    );
+    let result = Database::with_embedder(tmp.path().join("db"), Box::new(OtherBackend));
     assert!(
         result.is_err(),
         "a mismatched backend must be rejected, got: {:?}",

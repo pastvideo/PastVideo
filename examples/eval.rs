@@ -97,7 +97,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let corpus_dir = workdir.join("corpus_db");
     let db = Database::with_config(&corpus_dir, default_embedder(), cfg)?;
 
-    let corpus_files = ["red.mp4", "green.mp4", "blue.mp4", "white.mp4", "black.mp4", "busy.mp4"];
+    let corpus_files = [
+        "red.mp4",
+        "green.mp4",
+        "blue.mp4",
+        "white.mp4",
+        "black.mp4",
+        "busy.mp4",
+    ];
     eprintln!("Indexing corpus ...");
     let t0 = Instant::now();
     let mut report = pastvideo::IndexReport::default();
@@ -221,11 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- still-skip (gray, default config) ----
     let still_dir = workdir.join("still_db");
-    let sd = Database::with_config(
-        &still_dir,
-        default_embedder(),
-        Config::default(),
-    )?;
+    let sd = Database::with_config(&still_dir, default_embedder(), Config::default())?;
     let still_report = sd.insert_video(foot.join("gray.mp4"))?;
 
     let results = EvalResults {
@@ -271,18 +274,39 @@ fn run_ffmpeg(args: &[&str], out: &Path) {
 
 fn gen_color(out: &Path, color: &str, secs: u32) {
     let src = format!("color=c={color}:s=160x120:d={secs}");
-    run_ffmpeg(&["-y", "-f", "lavfi", "-i", &src, "-pix_fmt", "yuv420p"], out);
+    run_ffmpeg(
+        &["-y", "-f", "lavfi", "-i", &src, "-pix_fmt", "yuv420p"],
+        out,
+    );
 }
 
 fn gen_animated(out: &Path, secs: u32) {
     let src = "testsrc2=size=160x120:rate=25";
     let t = secs.to_string();
-    run_ffmpeg(&["-y", "-f", "lavfi", "-i", src, "-t", &t, "-pix_fmt", "yuv420p"], out);
+    run_ffmpeg(
+        &[
+            "-y", "-f", "lavfi", "-i", src, "-t", &t, "-pix_fmt", "yuv420p",
+        ],
+        out,
+    );
 }
 
 fn gen_image(out: &Path, color: &str) {
     let src = format!("color=c={color}:s=160x120:d=1");
-    run_ffmpeg(&["-y", "-f", "lavfi", "-i", &src, "-frames:v", "1", "-update", "1"], out);
+    run_ffmpeg(
+        &[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &src,
+            "-frames:v",
+            "1",
+            "-update",
+            "1",
+        ],
+        out,
+    );
 }
 
 fn probe_duration(path: &Path) -> Option<f64> {

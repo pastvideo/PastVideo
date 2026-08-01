@@ -9,7 +9,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Sanitized metadata keys written to the `meta` table.
 pub enum MetaKey {
@@ -97,7 +97,9 @@ impl SentryStore {
         let k = meta_key_str(key);
         let v: Option<String> = self
             .conn
-            .query_row("SELECT value FROM meta WHERE key=?1", params![k], |r| r.get(0))
+            .query_row("SELECT value FROM meta WHERE key=?1", params![k], |r| {
+                r.get(0)
+            })
             .optional()?;
         Ok(v)
     }
@@ -115,7 +117,13 @@ impl SentryStore {
         backend: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        let blob = encode_embedding(embedding);
+        if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+            return Err(Error::InvalidInput(
+                "embedding must be non-empty and contain only finite values".into(),
+            ));
+        }
+        let normalized = normalize_f32(embedding);
+        let blob = encode_embedding(&normalized);
         let dim = embedding.len() as i64;
         let now = now_iso();
         self.conn.execute(
@@ -140,7 +148,9 @@ impl SentryStore {
     pub fn has_chunk(&self, id: &str) -> Result<bool> {
         let v: Option<i64> = self
             .conn
-            .query_row("SELECT 1 FROM chunks WHERE id=?1", params![id], |r| r.get(0))
+            .query_row("SELECT 1 FROM chunks WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
             .optional()?;
         Ok(v.is_some())
     }
@@ -162,11 +172,20 @@ impl SentryStore {
         if total == 0 || n_results == 0 {
             return Ok(vec![]);
         }
+        let stored_dim: i64 = self
+            .conn
+            .query_row("SELECT dim FROM chunks LIMIT 1", [], |row| row.get(0))?;
+        if query.len() as i64 != stored_dim {
+            return Err(Error::InvalidInput(format!(
+                "query has {} dimensions but this index contains {stored_dim}-dimensional vectors",
+                query.len()
+            )));
+        }
         let qn = normalize_f64(query);
 
-        let mut stmt = self.conn.prepare(
-            "SELECT source_file, start_time, end_time, embedding FROM chunks",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source_file, start_time, end_time, embedding FROM chunks")?;
         let rows = stmt.query_map([], |r| {
             let blob: Vec<u8> = r.get(3)?;
             Ok((
@@ -191,7 +210,11 @@ impl SentryStore {
                 embedding: if include_embeddings { Some(emb) } else { None },
             });
         }
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(n_results.min(hits.len()));
         Ok(hits)
     }
@@ -257,7 +280,11 @@ pub fn make_chunk_id(source_file: &str, start_time: f64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("{source_file}:{start_time}"));
     let digest = hasher.finalize();
-    digest.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+    digest
+        .iter()
+        .take(8)
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -280,15 +307,31 @@ pub fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
 }
 
 fn normalize_f64(v: &[f32]) -> Vec<f64> {
-    let norm: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+    let norm: f64 = v
+        .iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        .sqrt();
     let n = if norm > 1e-12 { norm } else { 1.0 };
     v.iter().map(|&x| x as f64 / n).collect()
 }
 
+fn normalize_f32(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let divisor = if norm > 1e-12 { norm } else { 1.0 };
+    v.iter().map(|value| value / divisor).collect()
+}
+
 fn dot_f64(a: &[f64], b: &[f32]) -> f64 {
+    let norm = b
+        .iter()
+        .map(|value| (*value as f64) * (*value as f64))
+        .sum::<f64>()
+        .sqrt();
+    let divisor = if norm > 1e-12 { norm } else { 1.0 };
     a.iter()
         .zip(b.iter())
-        .map(|(x, y)| x * (*y as f64))
+        .map(|(x, y)| x * (*y as f64 / divisor))
         .sum()
 }
 
@@ -339,10 +382,26 @@ mod tests {
         let store = SentryStore::open(&dir.path().join("t.db")).unwrap();
         let q = vec![1.0, 0.0, 0.0_f32];
         store
-            .add_chunk("a", &[1.0, 0.0, 0.0], "/a.mp4", 0.0, 5.0, "baseline", Some("m"))
+            .add_chunk(
+                "a",
+                &[1.0, 0.0, 0.0],
+                "/a.mp4",
+                0.0,
+                5.0,
+                "baseline",
+                Some("m"),
+            )
             .unwrap();
         store
-            .add_chunk("b", &[0.0, 1.0, 0.0], "/b.mp4", 0.0, 5.0, "baseline", Some("m"))
+            .add_chunk(
+                "b",
+                &[0.0, 1.0, 0.0],
+                "/b.mp4",
+                0.0,
+                5.0,
+                "baseline",
+                Some("m"),
+            )
             .unwrap();
         let hits = store.search(&q, 2, false).unwrap();
         assert_eq!(hits[0].source_file, "/a.mp4");

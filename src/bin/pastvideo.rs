@@ -1,11 +1,14 @@
 //! pastvideo CLI — a thin wrapper over the `pastvideo` library [`Database`].
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
-use pastvideo::{default_embedder, Config, Database, HighlightMethod};
+use pastvideo::{
+    benchmark, default_embedder, qwen_embedder, server, Config, Database, HighlightMethod,
+};
 
 #[derive(Parser)]
 #[command(
@@ -18,14 +21,41 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
+    /// Embedding backend used for indexing and search.
+    #[arg(long, global = true, value_enum, default_value_t = Backend::Baseline)]
+    backend: Backend,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Backend {
+    Baseline,
+    Qwen,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Initialize the database (creates the data dir + schema).
     Init,
+
+    /// Run the fixed issue #68 local-hardware benchmark end to end.
+    Benchmark {
+        /// Markdown report path.
+        #[arg(long, default_value = "pastvideo-benchmark.md")]
+        output: PathBuf,
+    },
+
+    /// Run the local HTTP API used by the interactive web app.
+    Serve {
+        /// Address for the local API server.
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: SocketAddr,
+        /// Directory where saved search clips are written.
+        #[arg(long, default_value = ".tools/web-clips")]
+        clips: PathBuf,
+    },
 
     /// Index a video file or directory for searching.
     Index {
@@ -139,9 +169,10 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), String> {
     let data_dir = resolve_data_dir(cli.data_dir);
+    let backend = cli.backend;
     match cli.command {
         Command::Init => {
-            let db = open_db(&data_dir, Config::default())?;
+            let db = open_db(&data_dir, Config::default(), backend)?;
             println!(
                 "Initialized pastvideo at {} (backend: {}, model: {}).",
                 data_dir.display(),
@@ -149,6 +180,28 @@ fn run(cli: Cli) -> Result<(), String> {
                 db.model()
             );
             println!("Run: pastvideo index <path>");
+        }
+        Command::Benchmark { output } => {
+            let report = benchmark::run(&data_dir, &output).map_err(|error| error.to_string())?;
+            println!("\n{}", report.markdown);
+            println!("Report written to {}", report.output_path.display());
+        }
+        Command::Serve { bind, clips } => {
+            let db = open_db(&data_dir, Config::default(), backend)?;
+            let stats = db.stats().map_err(|error| error.to_string())?;
+            if stats.total_chunks == 0 {
+                return Err(format!(
+                    "the index at {} is empty; index a video before starting the web API",
+                    data_dir.display()
+                ));
+            }
+            println!(
+                "Serving {} indexed moments with {} ({})",
+                stats.total_chunks,
+                db.model(),
+                db.backend()
+            );
+            server::run(db, bind, expand(clips))?;
         }
         Command::Index {
             path,
@@ -166,7 +219,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 retry_failed,
                 ..Config::default()
             };
-            let db = open_db(&data_dir, cfg)?;
+            let db = open_db(&data_dir, cfg, backend)?;
             let report = if path.is_dir() {
                 db.insert_dir(&path)
             } else {
@@ -194,7 +247,9 @@ fn run(cli: Cli) -> Result<(), String> {
                 report.files_scanned,
             );
             if report.dlq_chunks > 0 {
-                println!("See `pastvideo dlq list`. Retry with `pastvideo index <path> --retry-failed`.");
+                println!(
+                    "See `pastvideo dlq list`. Retry with `pastvideo index <path> --retry-failed`."
+                );
             }
         }
         Command::Search {
@@ -205,8 +260,10 @@ fn run(cli: Cli) -> Result<(), String> {
             no_trim,
             save_top,
         } => {
-            let db = open_db(&data_dir, Config::default())?;
-            let hits = db.search_text(&query, results, dedupe).map_err(|e| e.to_string())?;
+            let db = open_db(&data_dir, Config::default(), backend)?;
+            let hits = db
+                .search_text(&query, results, dedupe)
+                .map_err(|e| e.to_string())?;
             present(&db, &hits, output, no_trim, save_top)?;
         }
         Command::Img {
@@ -217,7 +274,7 @@ fn run(cli: Cli) -> Result<(), String> {
             no_trim,
             save_top,
         } => {
-            let db = open_db(&data_dir, Config::default())?;
+            let db = open_db(&data_dir, Config::default(), backend)?;
             let hits = db
                 .search_image(&image, results, dedupe)
                 .map_err(|e| e.to_string())?;
@@ -234,7 +291,7 @@ fn run(cli: Cli) -> Result<(), String> {
         } => {
             let method = HighlightMethod::parse(&method)
                 .ok_or_else(|| format!("unknown method '{method}' (use centroid|knn|lof)"))?;
-            let db = open_db(&data_dir, Config::default())?;
+            let db = open_db(&data_dir, Config::default(), backend)?;
             let hits = db
                 .highlights(count, method, neighbors, dedupe, exclude_baseline)
                 .map_err(|e| e.to_string())?;
@@ -261,7 +318,7 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         }
         Command::Stats => {
-            let db = open_db(&data_dir, Config::default())?;
+            let db = open_db(&data_dir, Config::default(), backend)?;
             let s = db.stats().map_err(|e| e.to_string())?;
             if s.total_chunks == 0 {
                 println!("Index is empty. Run `pastvideo index <path>` first.");
@@ -281,12 +338,12 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         }
         Command::Reset => {
-            let db = open_db(&data_dir, Config::default())?;
+            let db = open_db(&data_dir, Config::default(), backend)?;
             db.reset().map_err(|e| e.to_string())?;
             println!("Index reset.");
         }
         Command::Dlq { cmd } => {
-            let db = open_db(&data_dir, Config::default())?;
+            let db = open_db(&data_dir, Config::default(), backend)?;
             match cmd {
                 DlqCmd::List => {
                     let entries = db.dlq_list().map_err(|e| e.to_string())?;
@@ -371,8 +428,12 @@ fn to_match(a: &pastvideo::Anomaly) -> Option<pastvideo::Match> {
     })
 }
 
-fn open_db(data_dir: &PathBuf, cfg: Config) -> Result<Database, String> {
-    Database::with_config(data_dir, default_embedder(), cfg).map_err(|e| e.to_string())
+fn open_db(data_dir: &PathBuf, cfg: Config, backend: Backend) -> Result<Database, String> {
+    let embedder = match backend {
+        Backend::Baseline => default_embedder(),
+        Backend::Qwen => qwen_embedder().map_err(|error| error.to_string())?,
+    };
+    Database::with_config(data_dir, embedder, cfg).map_err(|e| e.to_string())
 }
 
 fn resolve_data_dir(flag: Option<PathBuf>) -> PathBuf {
@@ -396,12 +457,12 @@ fn resolve_output(flag: Option<PathBuf>) -> PathBuf {
 fn expand(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             return PathBuf::from(home).join(rest);
         }
     }
     if s == "~" {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             return PathBuf::from(home);
         }
     }
