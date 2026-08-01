@@ -5,6 +5,7 @@
 //! the loaded vectors — simple and correct for moderate indexes; an ANN index
 //! (HNSW) is future work.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -168,8 +169,18 @@ impl SentryStore {
         n_results: usize,
         include_embeddings: bool,
     ) -> Result<Vec<Hit>> {
+        self.search_in_sources(query, n_results, include_embeddings, None)
+    }
+
+    pub(crate) fn search_in_sources(
+        &self,
+        query: &[f32],
+        n_results: usize,
+        include_embeddings: bool,
+        allowed_source_files: Option<&HashSet<String>>,
+    ) -> Result<Vec<Hit>> {
         let total = self.count()?;
-        if total == 0 || n_results == 0 {
+        if total == 0 || n_results == 0 || allowed_source_files.is_some_and(HashSet::is_empty) {
             return Ok(vec![]);
         }
         let stored_dim: i64 = self
@@ -199,6 +210,9 @@ impl SentryStore {
         let mut hits: Vec<Hit> = vec![];
         for row in rows {
             let (source_file, start_time, end_time, blob) = row?;
+            if allowed_source_files.is_some_and(|allowed| !allowed.contains(&source_file)) {
+                continue;
+            }
             let emb = decode_embedding(&blob);
             let score = dot_f64(&qn, &emb);
             hits.push(Hit {

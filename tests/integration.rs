@@ -58,9 +58,11 @@ fn end_to_end_index_search_trim() {
     let tmp = tempfile::tempdir().unwrap();
     let red = tmp.path().join("red.mp4");
     let green = tmp.path().join("green.mp4");
+    let blue = tmp.path().join("blue.mp4");
     let red_img = tmp.path().join("red.png");
     make_color_video(&red, "0xFF0000", 4);
     make_color_video(&green, "0x00FF00", 4);
+    make_color_video(&blue, "0x0000FF", 4);
     make_color_image(&red_img, "0xFF0000");
 
     // skip_still off (solid colors are "still"); preprocess off for speed.
@@ -107,6 +109,20 @@ fn end_to_end_index_search_trim() {
         g_green > g_red,
         "green query should rank green ({g_green}) above red ({g_red})"
     );
+
+    // Library-scoped search excludes both an indexed file outside the current
+    // library and a current-library video that has not been indexed yet.
+    let scoped = db
+        .search_text_in_files("green", &[red.clone(), blue.clone()], 5, None)
+        .unwrap();
+    assert!(!scoped.is_empty());
+    assert!(scoped
+        .iter()
+        .all(|item| item.source_file.ends_with("red.mp4")));
+    assert!(db
+        .search_text_in_files("blue", std::slice::from_ref(&blue), 5, None)
+        .unwrap()
+        .is_empty());
 
     // Highlights work over the stored vectors.
     let hl = db

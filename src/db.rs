@@ -5,6 +5,7 @@
 //! embeds and ranks automatically. Callers never touch chunker/embedder/store
 //! directly.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -18,7 +19,7 @@ use crate::dlq::{DeadLetterQueue, DlqEntry};
 use crate::embedder::{default_embedder, Embedder, VideoSpan};
 use crate::error::{is_permanent_failure, Error, Result};
 use crate::highlights::{rank_highlights, AgainstMode, Anomaly, Method as HighlightMethod};
-use crate::search::search_with_embedding;
+use crate::search::{search_with_embedding, search_with_embedding_in_sources};
 use crate::store::{make_chunk_id, Hit, MetaKey, SentryStore, Stats};
 use crate::trimmer::{trim_clip, DEFAULT_PADDING};
 
@@ -710,6 +711,34 @@ impl Database {
         let emb = self.embedder.embed_text(query)?;
         self.validate_embedding(&emb)?;
         self.search_embedding(&emb, n_results, dedupe)
+    }
+
+    /// Search only indexed videos from the supplied library file list.
+    /// Files without stored chunks and indexed files outside the list are not
+    /// eligible candidates.
+    pub fn search_text_in_files(
+        &self,
+        query: &str,
+        source_files: &[PathBuf],
+        n_results: usize,
+        dedupe: Option<f64>,
+    ) -> Result<Vec<Match>> {
+        let indexed: HashSet<String> = self.store.stats()?.source_files.into_iter().collect();
+        let allowed: HashSet<String> = source_files
+            .iter()
+            .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+            .map(|path| path.to_string_lossy().into_owned())
+            .filter(|path| indexed.contains(path))
+            .collect();
+        if allowed.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let emb = self.embedder.embed_text(query)?;
+        self.validate_embedding(&emb)?;
+        let hits =
+            search_with_embedding_in_sources(&emb, &self.store, n_results, dedupe, Some(&allowed))?;
+        Ok(hits.iter().map(Match::from_hit).collect())
     }
 
     pub(crate) fn embed_texts(&self, queries: &[String]) -> Result<Vec<Vec<f32>>> {

@@ -1,5 +1,7 @@
 //! Query/retrieval helpers: brute-force search + near-duplicate dedupe.
 
+use std::collections::HashSet;
+
 use crate::error::Result;
 use crate::store::{Hit, SentryStore};
 
@@ -11,8 +13,23 @@ pub fn search_with_embedding(
     n_results: usize,
     dedupe_threshold: Option<f64>,
 ) -> Result<Vec<Hit>> {
+    search_with_embedding_in_sources(embedding, store, n_results, dedupe_threshold, None)
+}
+
+pub(crate) fn search_with_embedding_in_sources(
+    embedding: &[f32],
+    store: &SentryStore,
+    n_results: usize,
+    dedupe_threshold: Option<f64>,
+    allowed_source_files: Option<&HashSet<String>>,
+) -> Result<Vec<Hit>> {
     let include_embeddings = dedupe_threshold.is_some();
-    let mut hits = store.search(embedding, n_results, include_embeddings)?;
+    let mut hits = store.search_in_sources(
+        embedding,
+        n_results,
+        include_embeddings,
+        allowed_source_files,
+    )?;
     // store.search returns results sorted by score (desc).
 
     if let Some(threshold) = dedupe_threshold {

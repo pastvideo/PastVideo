@@ -326,6 +326,8 @@ impl PastVideoApp {
             }
         };
         let data_dir = self.data_dir(&settings);
+        let candidate_files: Vec<PathBuf> =
+            self.videos.iter().map(|video| video.path.clone()).collect();
         let tx = self.tx.clone();
         self.searching = true;
         self.notice = None;
@@ -334,7 +336,7 @@ impl PastVideoApp {
             let result = (|| -> std::result::Result<Vec<Match>, String> {
                 let db = Database::with_embedder(&data_dir, embedder.boxed())
                     .map_err(|error| error.to_string())?;
-                db.search_text(&query, 48, Some(0.985))
+                db.search_text_in_files(&query, &candidate_files, 48, Some(0.985))
                     .map_err(|error| error.to_string())
             })();
             let _ = tx.send(WorkerMessage::SearchFinished(result));
