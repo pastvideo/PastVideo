@@ -1,0 +1,47 @@
+//! # pastvideo
+//!
+//! A Rust video-search database. Index footage, then search it by natural
+//! language or reference image — the whole pipeline (chunk → preprocess →
+//! skip stills → embed → store → search → trim) runs *inside* the database.
+//!
+//! ```no_run
+//! # use pastvideo::{Database, HighlightMethod};
+//! let db = Database::open("~/.pastvideo")?;
+//!
+//! // INSERT — the DB chunks/preprocesses/embeds/stores automatically.
+//! db.insert_video("footage/front.mp4")?;
+//!
+//! // QUERY — the DB embeds + ranks automatically.
+//! let hits = db.search_text("red truck", 5, None)?;
+//! for m in &hits {
+//!     println!("[{:.2}] {} @ {:.0}-{:.0}", m.score, m.source_file, m.start_time, m.end_time);
+//! }
+//!
+//! let anomalies = db.highlights(3, HighlightMethod::Knn, 10, 0.9, false)?;
+//! let clip = db.trim(&hits[0], "~/sentrysearch_clips")?;
+//! # Ok::<(), pastvideo::Error>(())
+//! ```
+//!
+//! Embeddings are produced by a pluggable [`Embedder`]. The default
+//! [`BaselineEmbedder`](embedder::baseline::BaselineEmbedder) runs fully offline
+//! (frame color/motion features via ffmpeg); real multimodal models can be
+//! implemented against the trait and supplied via [`Database::with_embedder`].
+
+pub mod chunker;
+pub mod dlq;
+pub mod embedder;
+pub mod error;
+pub mod highlights;
+pub mod search;
+pub mod store;
+pub mod trimmer;
+
+mod db;
+
+pub use db::{Config, Database, IndexReport, Match};
+pub use dlq::{DeadLetterQueue, DlqEntry};
+pub use embedder::{default_embedder, Embedder};
+pub use error::{Error, Result};
+pub use highlights::{AgainstMode, Anomaly, Method as HighlightMethod};
+pub use store::{make_chunk_id, Hit, Stats};
+pub use trimmer::trim_clip;

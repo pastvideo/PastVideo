@@ -1,0 +1,30 @@
+[package]
+name = "pastvideo"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust video-search database: index footage, search by text or image"
+license = "Apache-2.0"
+repository = "https://github.com/flow/pastvideo"
+
+[lib]
+name = "pastvideo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pastvideo"
+path = "src/bin/pastvideo.rs"
+
+[features]
+default = []
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
