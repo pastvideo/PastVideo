@@ -12,6 +12,7 @@ pub mod qwen;
 pub mod remote;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::Result;
 
@@ -78,6 +79,70 @@ pub trait Embedder: Send + Sync {
 
     /// Model identifier (e.g. `"baseline-v1"`).
     fn model(&self) -> &str;
+}
+
+/// A clonable handle that lets indexing and search share one loaded backend.
+///
+/// Local GPU embedders keep their model worker behind an internal mutex, so a
+/// text query waits only for the current video batch and does not load a second
+/// copy of the model into VRAM.
+#[derive(Clone)]
+pub struct SharedEmbedder(Arc<dyn Embedder>);
+
+impl SharedEmbedder {
+    pub fn new(embedder: Box<dyn Embedder>) -> Self {
+        Self(Arc::from(embedder))
+    }
+
+    pub fn boxed(&self) -> Box<dyn Embedder> {
+        Box::new(self.clone())
+    }
+}
+
+impl Embedder for SharedEmbedder {
+    fn embed_video_chunk(&self, chunk_path: &Path) -> Result<Vec<f32>> {
+        self.0.embed_video_chunk(chunk_path)
+    }
+
+    fn embed_video_chunks(&self, chunk_paths: &[PathBuf]) -> Result<Vec<Vec<f32>>> {
+        self.0.embed_video_chunks(chunk_paths)
+    }
+
+    fn video_batch_size(&self) -> usize {
+        self.0.video_batch_size()
+    }
+
+    fn supports_video_spans(&self) -> bool {
+        self.0.supports_video_spans()
+    }
+
+    fn embed_video_spans(&self, spans: &[VideoSpan]) -> Result<Vec<Vec<f32>>> {
+        self.0.embed_video_spans(spans)
+    }
+
+    fn embed_text(&self, query: &str) -> Result<Vec<f32>> {
+        self.0.embed_text(query)
+    }
+
+    fn embed_texts(&self, queries: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.0.embed_texts(queries)
+    }
+
+    fn embed_image(&self, image_path: &Path) -> Result<Vec<f32>> {
+        self.0.embed_image(image_path)
+    }
+
+    fn dimensions(&self) -> usize {
+        self.0.dimensions()
+    }
+
+    fn backend(&self) -> &str {
+        self.0.backend()
+    }
+
+    fn model(&self) -> &str {
+        self.0.model()
+    }
 }
 
 /// The default offline embedder, boxed for convenience.

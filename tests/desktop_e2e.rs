@@ -3,12 +3,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use pastvideo::catalog::{
     apply_categories, load_categories, make_thumbnail, save_categories, scan_folder,
     semantic_categories,
 };
-use pastvideo::{default_embedder, Config, Database};
+use pastvideo::{default_embedder, Config, Database, SharedEmbedder};
 
 fn ffmpeg_available() -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
@@ -80,4 +83,63 @@ fn desktop_folder_to_search_workflow() {
     assert_eq!(restored, categories);
     apply_categories(&mut catalog, &restored);
     assert!(catalog.iter().all(|video| video.category != "Unsorted"));
+}
+
+#[test]
+fn search_reads_partial_index_while_indexing_continues() {
+    if !ffmpeg_available() {
+        eprintln!("skipping desktop E2E: ffmpeg unavailable");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let red = temp.path().join("a-family").join("birthday_red.mp4");
+    let green = temp.path().join("z-nature").join("forest_green.mp4");
+    make_video(&red, "red");
+    make_video(&green, "green");
+
+    let db_dir = temp.path().join("database");
+    let shared = SharedEmbedder::new(default_embedder());
+    let index_embedder = shared.clone();
+    let index_dir = db_dir.clone();
+    let folder = temp.path().to_path_buf();
+    let (partial_tx, partial_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let indexing = thread::spawn(move || {
+        let db = Database::with_config(
+            &index_dir,
+            index_embedder.boxed(),
+            Config {
+                preprocess: false,
+                skip_still: false,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let mut paused = false;
+        db.insert_dir_with_progress(&folder, |progress| {
+            if !paused && progress.files_completed == 1 {
+                paused = true;
+                partial_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        })
+        .unwrap()
+    });
+
+    partial_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the first file should be searchable before indexing finishes");
+    let search_db = Database::with_embedder(&db_dir, shared.boxed()).unwrap();
+    let partial_hits = search_db.search_text("red", 10, None).unwrap();
+    assert_eq!(search_db.stats().unwrap().unique_source_files, 1);
+    assert!(partial_hits
+        .first()
+        .unwrap()
+        .source_file
+        .ends_with("birthday_red.mp4"));
+
+    resume_tx.send(()).unwrap();
+    let report = indexing.join().unwrap();
+    assert_eq!(report.files_indexed, 2);
+    assert_eq!(search_db.stats().unwrap().unique_source_files, 2);
 }

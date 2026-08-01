@@ -21,7 +21,7 @@ use crate::catalog::{
 };
 use crate::chunker::find_ffmpeg;
 use crate::provider::{create_embedder, EmbeddingProvider, EmbeddingSettings};
-use crate::{Config, Database, IndexProgress, IndexReport, Match};
+use crate::{Config, Database, IndexProgress, IndexReport, Match, SharedEmbedder};
 
 const INK: Color32 = Color32::from_rgb(13, 15, 15);
 const PANEL: Color32 = Color32::from_rgb(20, 23, 22);
@@ -43,7 +43,6 @@ struct Preferences {
 enum TaskKind {
     Scanning,
     Indexing,
-    Searching,
     TestingProvider,
 }
 
@@ -52,7 +51,6 @@ impl TaskKind {
         match self {
             Self::Scanning => "Scanning folder",
             Self::Indexing => "Indexing videos",
-            Self::Searching => "Searching moments",
             Self::TestingProvider => "Testing connection",
         }
     }
@@ -92,6 +90,8 @@ pub struct PastVideoApp {
     searched_query: Option<String>,
     search_results: Vec<Match>,
     task: Option<TaskKind>,
+    searching: bool,
+    shared_embedder: Option<SharedEmbedder>,
     index_progress: Option<IndexProgress>,
     notice: Option<(String, bool)>,
     settings_open: bool,
@@ -126,6 +126,8 @@ impl PastVideoApp {
             searched_query: None,
             search_results: vec![],
             task: None,
+            searching: false,
+            shared_embedder: None,
             index_progress: None,
             notice: None,
             settings_open: false,
@@ -206,12 +208,32 @@ impl PastVideoApp {
         }
     }
 
+    fn get_shared_embedder(
+        &mut self,
+        settings: &EmbeddingSettings,
+    ) -> std::result::Result<SharedEmbedder, String> {
+        if let Some(embedder) = self.shared_embedder.as_ref() {
+            return Ok(embedder.clone());
+        }
+        let embedder =
+            SharedEmbedder::new(create_embedder(settings).map_err(|error| error.to_string())?);
+        self.shared_embedder = Some(embedder.clone());
+        Ok(embedder)
+    }
+
     fn start_index(&mut self) {
         let Some(folder) = self.preferences.last_folder.clone() else {
             self.notice = Some(("Choose a folder first.".into(), true));
             return;
         };
         let settings = self.preferences.embedding.clone();
+        let embedder = match self.get_shared_embedder(&settings) {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                self.notice = Some((friendly_error(&error), true));
+                return;
+            }
+        };
         let data_dir = self.data_dir(&settings);
         let categories_path = self.categories_path(&settings);
         let tx = self.tx.clone();
@@ -221,12 +243,11 @@ impl PastVideoApp {
         self.notice = None;
         thread::spawn(move || {
             let result = (|| -> std::result::Result<IndexOutcome, String> {
-                let embedder = create_embedder(&settings).map_err(|error| error.to_string())?;
                 let config = Config {
                     skip_still: false,
                     ..Config::default()
                 };
-                let db = Database::with_config(&data_dir, embedder, config)
+                let db = Database::with_config(&data_dir, embedder.boxed(), config)
                     .map_err(|error| error.to_string())?;
                 let category_embeddings = build_category_embeddings(&db).unwrap_or_default();
                 let mut live_categories = load_categories(&categories_path);
@@ -288,16 +309,25 @@ impl PastVideoApp {
             self.selected_match = None;
             return;
         }
+        if self.searching {
+            return;
+        }
         let settings = self.preferences.embedding.clone();
+        let embedder = match self.get_shared_embedder(&settings) {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                self.notice = Some((friendly_error(&error), true));
+                return;
+            }
+        };
         let data_dir = self.data_dir(&settings);
         let tx = self.tx.clone();
-        self.task = Some(TaskKind::Searching);
+        self.searching = true;
         self.notice = None;
         self.searched_query = Some(query.clone());
         thread::spawn(move || {
             let result = (|| -> std::result::Result<Vec<Match>, String> {
-                let embedder = create_embedder(&settings).map_err(|error| error.to_string())?;
-                let db = Database::with_embedder(&data_dir, embedder)
+                let db = Database::with_embedder(&data_dir, embedder.boxed())
                     .map_err(|error| error.to_string())?;
                 db.search_text(&query, 48, Some(0.985))
                     .map_err(|error| error.to_string())
@@ -385,7 +415,7 @@ impl PastVideoApp {
                     }
                 }
                 WorkerMessage::SearchFinished(result) => {
-                    self.task = None;
+                    self.searching = false;
                     match result {
                         Ok(results) => {
                             self.selected_match = results.first().cloned();
@@ -412,6 +442,7 @@ impl PastVideoApp {
 
     fn save_settings(&mut self) {
         self.preferences.embedding = self.settings_draft.clone();
+        self.shared_embedder = None;
         self.persist();
         self.search_results.clear();
         self.searched_query = None;
@@ -786,7 +817,7 @@ impl PastVideoApp {
                     }
                     let enter =
                         input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                    let enabled = self.task.is_none() && !self.search_query.trim().is_empty();
+                    let enabled = !self.searching && !self.search_query.trim().is_empty();
                     if ui
                         .add_enabled(
                             enabled,
@@ -1039,7 +1070,7 @@ impl PastVideoApp {
             });
         });
         ui.add_space(16.0);
-        if self.task == Some(TaskKind::Searching) {
+        if self.searching {
             loading_panel(ui, "Searching every indexed moment…");
         } else if self.search_results.is_empty() {
             empty_panel(
@@ -1223,7 +1254,7 @@ impl PastVideoApp {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
-                            self.task.is_none(),
+                            self.task.is_none() && !self.searching,
                             egui::Button::new("Test connection").fill(PANEL),
                         )
                         .clicked()
@@ -1232,7 +1263,13 @@ impl PastVideoApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new(RichText::new("Save settings").strong().color(INK)).fill(SIGNAL))
+                            .add_enabled(
+                                self.task.is_none() && !self.searching,
+                                egui::Button::new(
+                                    RichText::new("Save settings").strong().color(INK),
+                                )
+                                .fill(SIGNAL),
+                            )
                             .clicked()
                         {
                             self.save_settings();
@@ -1280,7 +1317,7 @@ impl eframe::App for PastVideoApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         self.process_messages(&ctx);
-        if self.task.is_some() {
+        if self.task.is_some() || self.searching {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
         self.show_top_bar(root);
@@ -1297,7 +1334,7 @@ impl eframe::App for PastVideoApp {
                 self.show_search(ui);
                 ui.add_space(24.0);
                 if let Some(task) = self.task {
-                    if task != TaskKind::Scanning && task != TaskKind::Searching {
+                    if task != TaskKind::Scanning {
                         if task == TaskKind::Indexing {
                             self.show_index_progress(ui);
                         } else {
