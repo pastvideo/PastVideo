@@ -28,11 +28,14 @@
 //! implemented against the trait and supplied via [`Database::with_embedder`].
 
 pub mod benchmark;
+pub mod catalog;
 pub mod chunker;
+pub mod desktop;
 pub mod dlq;
 pub mod embedder;
 pub mod error;
 pub mod highlights;
+pub mod provider;
 pub mod search;
 pub mod server;
 pub mod store;
@@ -42,9 +45,12 @@ mod db;
 
 pub use db::{Config, Database, IndexReport, Match};
 pub use dlq::{DeadLetterQueue, DlqEntry};
+pub use embedder::gemini::{GeminiConfig, GeminiEmbedder};
 pub use embedder::qwen::{QwenConfig, QwenEmbedder};
+pub use embedder::remote::{RemoteConfig, RemoteEmbedder};
 pub use embedder::{default_embedder, qwen_embedder, Embedder};
 pub use error::{Error, Result};
 pub use highlights::{AgainstMode, Anomaly, Method as HighlightMethod};
+pub use provider::{create_embedder, EmbeddingProvider, EmbeddingSettings};
 pub use store::{make_chunk_id, Hit, Stats};
 pub use trimmer::trim_clip;

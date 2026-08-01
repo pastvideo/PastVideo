@@ -1,6 +1,43 @@
 # PastVideo
 
-PastVideo is a local semantic video-search database. It chunks footage, embeds
+PastVideo is a native video library and local semantic video-search database.
+Choose a folder and the Windows app recursively finds, thumbnails, indexes, and
+automatically categorizes the videos beneath it. Search for moments in natural
+language, then play the matching video or exact interval.
+
+## Run the native Windows app
+
+```powershell
+.\scripts\run_desktop.ps1
+```
+
+PastVideo starts as a real native desktop window; it does not require or open a
+browser. Gemini Embedding 2 is the default provider. Add `GEMINI_API_KEY` in the
+environment or open **Settings** and enter a key for the current session.
+
+Provider choices in Settings:
+
+- **Gemini** (default): `gemini-embedding-2`, a managed multimodal embedding API.
+- **Remote service**: a configurable HTTP endpoint, useful for another GPU on
+  this machine or the local network.
+- **Local GPU**: the existing Qwen3-VL worker.
+- **Local CPU**: a lightweight offline baseline for testing and simple visual
+  searches.
+
+Indexes are isolated by provider/model so incompatible vectors never mix. API
+keys are held in memory and are not written to the preferences file. Supported
+library formats are MP4, MOV, M4V, MKV, AVI, WebM, WMV, MTS, and M2TS.
+
+To build a portable Windows folder containing `PastVideo.exe` and the available
+ffmpeg tools:
+
+```powershell
+.\scripts\package_windows.ps1
+```
+
+## Core search engine
+
+PastVideo chunks footage, embeds
 each moment, stores vectors in SQLite, searches by natural language or an image,
 and trims the selected result. The real retrieval backend is the official
 [`Qwen/Qwen3-VL-Embedding-2B`](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B)

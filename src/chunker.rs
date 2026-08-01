@@ -11,7 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 
-pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &[".mp4", ".mov"];
+pub const SUPPORTED_VIDEO_EXTENSIONS: &[&str] = &[
+    ".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".wmv", ".mts", ".m2ts",
+];
 
 /// Number of frames the baseline embedder samples per chunk.
 pub const FRAME_SAMPLES: usize = 8;
@@ -48,7 +50,7 @@ pub fn find_ffmpeg() -> Result<PathBuf> {
         .next()
         .ok_or_else(|| {
             Error::Ffmpeg(
-                "ffmpeg not found on PATH. Install ffmpeg (e.g. `brew install ffmpeg`).".into(),
+                "ffmpeg was not found. Install ffmpeg or set PASTVIDEO_FFMPEG in Settings.".into(),
             )
         })
 }
@@ -71,11 +73,22 @@ fn find_program(prog: &str, override_var: &str) -> Vec<PathBuf> {
     } else {
         prog.to_owned()
     };
-    let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(".tools/ffmpeg/bin")
-        .join(bundled_name);
-    if bundled.is_file() {
-        return vec![bundled];
+    let mut bundled_candidates = vec![];
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            bundled_candidates.push(parent.join(&bundled_name));
+            bundled_candidates.push(parent.join("bin").join(&bundled_name));
+        }
+    }
+    bundled_candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".tools/ffmpeg/bin")
+            .join(&bundled_name),
+    );
+    for bundled in bundled_candidates {
+        if bundled.is_file() {
+            return vec![bundled];
+        }
     }
     which(prog)
 }
@@ -250,10 +263,29 @@ pub fn chunk_video(video_path: &Path, chunk_duration: f64, overlap: f64) -> Resu
             .output()
             .map_err(|e| Error::Ffmpeg(format!("ffmpeg chunk failed: {e}")))?;
         if !out.status.success() {
-            return Err(Error::Ffmpeg(format!(
-                "ffmpeg chunk {idx} failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+            // Some containers/codecs cannot be stream-copied into MP4. Fall
+            // back to a broadly compatible transcode so MKV/WebM/AVI libraries
+            // still index without user intervention.
+            let fallback = Command::new(&ffmpeg)
+                .args(["-y", "-ss"])
+                .arg(start.to_string())
+                .arg("-i")
+                .arg(&abs)
+                .args(["-t"])
+                .arg(length.to_string())
+                .args([
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-c:a", "aac", "-b:a",
+                    "96k",
+                ])
+                .arg(&chunk_path)
+                .output()
+                .map_err(|e| Error::Ffmpeg(format!("ffmpeg chunk fallback failed: {e}")))?;
+            if !fallback.status.success() {
+                return Err(Error::Ffmpeg(format!(
+                    "ffmpeg chunk {idx} failed: {}",
+                    String::from_utf8_lossy(&fallback.stderr).trim()
+                )));
+            }
         }
         chunks.push(Chunk {
             path: chunk_path,
@@ -506,6 +538,8 @@ mod tests {
     fn supported_extensions() {
         assert!(is_supported_video_file(Path::new("/a/b.MP4")));
         assert!(is_supported_video_file(Path::new("/a/b.mov")));
+        assert!(is_supported_video_file(Path::new("/a/b.mkv")));
+        assert!(is_supported_video_file(Path::new("/a/b.WEBM")));
         assert!(!is_supported_video_file(Path::new("/a/b.txt")));
     }
 

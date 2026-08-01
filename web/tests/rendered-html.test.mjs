@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
+import { prefixStaticAssets } from "../scripts/static-html.mjs";
 
 process.env.NEXT_PUBLIC_PASTVIDEO_BASE = "/pastvideo_demo";
 
@@ -9,8 +10,10 @@ async function render() {
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
 
-  return worker.fetch(
-    new Request("http://localhost/pastvideo_demo/", {
+  const response = await worker.fetch(
+    // vinext strips basePath before the worker route. Request the app route
+    // directly while keeping NEXT_PUBLIC_PASTVIDEO_BASE for generated assets.
+    new Request("http://localhost/", {
       headers: { accept: "text/html" },
     }),
     {
@@ -23,6 +26,8 @@ async function render() {
       passThroughOnException() {},
     },
   );
+  const html = prefixStaticAssets(await response.text(), process.env.NEXT_PUBLIC_PASTVIDEO_BASE);
+  return new Response(html, { status: response.status, headers: response.headers });
 }
 
 test("server-renders the PastVideo search shell and social metadata", async () => {

@@ -7,7 +7,9 @@
 //! dropped in via [`Database::with_embedder`](crate::Database::with_embedder).
 
 pub mod baseline;
+pub mod gemini;
 pub mod qwen;
+pub mod remote;
 
 use std::path::Path;
 

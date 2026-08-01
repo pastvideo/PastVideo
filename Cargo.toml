@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "pastvideo"
 path = "src/bin/pastvideo.rs"
 
+[[bin]]
+name = "pastvideo-desktop"
+path = "src/bin/pastvideo_desktop.rs"
+
 [features]
 default = []
 
@@ -25,11 +29,16 @@ serde_json = "1"
 thiserror = "1"
 anyhow = "1"
 sha2 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tempfile = "3"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+base64 = "0.23"
+dirs = "6"
+eframe = { version = "0.35", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
+opener = "0.8"
+rfd = "0.17"
 
 [dev-dependencies]
