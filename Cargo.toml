@@ -2,9 +2,9 @@
 name = "pastvideo"
 version = "0.1.0"
 edition = "2021"
-description = "A Rust video-search database: index footage, search by text or image"
+description = "An open-source video database for indexing, searching, and exploring video libraries"
 license = "Apache-2.0"
-repository = "https://github.com/flow/pastvideo"
+repository = "https://github.com/pastvideo/PastVideo"
 
 [lib]
 name = "pastvideo"
