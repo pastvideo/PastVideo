@@ -34,8 +34,10 @@ pub mod chunker;
 pub mod desktop;
 pub mod dlq;
 pub mod embedder;
+pub mod enrichment;
 pub mod error;
 pub mod highlights;
+pub mod local_understanding;
 pub mod provider;
 pub mod search;
 pub mod server;
@@ -57,8 +59,13 @@ pub use embedder::gemini::{GeminiConfig, GeminiEmbedder};
 pub use embedder::qwen::{QwenConfig, QwenEmbedder};
 pub use embedder::remote::{RemoteConfig, RemoteEmbedder};
 pub use embedder::{default_embedder, qwen_embedder, Embedder, SharedEmbedder, VideoSpan};
+pub use enrichment::{searchable_text, EnrichmentHit, EnrichmentIndexReport, EnrichmentStore};
 pub use error::{Error, Result};
 pub use highlights::{AgainstMode, Anomaly, Method as HighlightMethod};
+pub use local_understanding::{
+    run_local_analyzers, split_local_analyzer_configs, LocalUnderstandingConfig,
+    LocalUnderstandingReport,
+};
 pub use provider::{create_embedder, EmbeddingProvider, EmbeddingSettings};
 pub use store::{make_chunk_id, Hit, Stats};
 pub use trimmer::trim_clip;

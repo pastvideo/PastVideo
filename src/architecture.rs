@@ -674,6 +674,24 @@ impl KnowledgeDatabase {
         id.map(|id| self.media(&id)).transpose()
     }
 
+    /// Return a previously completed idempotent understanding run, if any.
+    pub fn understanding_by_key(
+        &self,
+        media_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<UnderstandingResult>> {
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM understanding_runs
+                 WHERE media_id=?1 AND idempotency_key=?2 AND status='completed'",
+                params![media_id, idempotency_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        id.map(|id| self.understanding(&id)).transpose()
+    }
+
     /// Atomically persist one understanding run and independent artifacts for
     /// every successful analyzer output. Repeating the same idempotency key and
     /// request returns the existing immutable artifacts.

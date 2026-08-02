@@ -18,7 +18,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
-use crate::{make_chunk_id, Database, Match};
+use crate::{make_chunk_id, Database, EnrichmentStore, Match};
 
 #[derive(Clone)]
 struct AppState {
@@ -34,6 +34,8 @@ struct StatusResponse {
     model: String,
     total_chunks: i64,
     source_files: i64,
+    understanding_records: i64,
+    understanding_modalities: std::collections::BTreeMap<String, i64>,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +70,9 @@ struct SearchResult {
     filename: String,
     media_id: String,
     media_url: String,
+    primary_modality: String,
+    evidence: Option<String>,
+    score_breakdown: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Deserialize)]
@@ -145,14 +150,27 @@ async fn status(State(state): State<AppState>) -> Response {
         Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "database lock failed"),
     };
     match db.stats() {
-        Ok(stats) => Json(StatusResponse {
-            ready: stats.total_chunks > 0,
-            backend: db.backend().to_owned(),
-            model: db.model().to_owned(),
-            total_chunks: stats.total_chunks,
-            source_files: stats.unique_source_files,
-        })
-        .into_response(),
+        Ok(stats) => {
+            let (understanding_records, understanding_modalities) =
+                EnrichmentStore::open(db.data_dir())
+                    .and_then(|store| {
+                        Ok((
+                            store.count()?,
+                            store.modality_counts()?.into_iter().collect(),
+                        ))
+                    })
+                    .unwrap_or_default();
+            Json(StatusResponse {
+                ready: stats.total_chunks > 0,
+                backend: db.backend().to_owned(),
+                model: db.model().to_owned(),
+                total_chunks: stats.total_chunks,
+                source_files: stats.unique_source_files,
+                understanding_records,
+                understanding_modalities,
+            })
+            .into_response()
+        }
         Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
@@ -191,7 +209,7 @@ async fn search(State(state): State<AppState>, Json(request): Json<SearchRequest
             Ok(db) => db,
             Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "database lock failed"),
         };
-        match db.search_text(&query, count, request.dedupe) {
+        match db.search_multimodal(&query, count, request.dedupe) {
             Ok(matches) => matches,
             Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         }
@@ -235,6 +253,9 @@ fn to_search_result(index: usize, item: Match) -> SearchResult {
         filename: descriptor.filename,
         media_id: descriptor.media_id,
         media_url: descriptor.media_url,
+        primary_modality: item.primary_modality,
+        evidence: item.evidence,
+        score_breakdown: item.score_breakdown,
     }
 }
 
@@ -255,6 +276,9 @@ async fn clip(State(state): State<AppState>, Json(request): Json<ClipRequest>) -
         start_time: request.start_time,
         end_time: request.end_time,
         score: 0.0,
+        primary_modality: "visual".into(),
+        evidence: None,
+        score_breakdown: Default::default(),
     };
     let output = {
         let db = match state.db.lock() {
@@ -326,6 +350,9 @@ mod tests {
                 start_time: 2.0,
                 end_time: 8.0,
                 score: 0.75,
+                primary_modality: "visual".into(),
+                evidence: None,
+                score_breakdown: Default::default(),
             },
         );
         assert_eq!(result.rank, 1);

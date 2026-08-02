@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$EnvironmentDir = "$env:USERPROFILE\.venvs\qwen3-vl-cu128",
-    [string]$ModelDir = "$env:USERPROFILE\.cache\pastvideo\models\Qwen3-VL-Embedding-2B-modelscope"
+    [string]$ModelDir = "$env:USERPROFILE\.cache\pastvideo\models\Qwen3-VL-Embedding-2B-modelscope",
+    [switch]$SkipUnderstandingModelDownload
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +37,9 @@ uv pip install --python $python `
     "PyNvVideoCodec==2.2.0" `
     "modelscope>=1.39.0"
 
+$understandingRequirements = Join-Path $PSScriptRoot "..\python\requirements-understanding.txt"
+uv pip install --python $python -r $understandingRequirements
+
 $modelFile = Join-Path $ModelDir "model.safetensors"
 if (-not (Test-Path -LiteralPath $modelFile)) {
     New-Item -ItemType Directory -Force $ModelDir | Out-Null
@@ -43,5 +47,13 @@ if (-not (Test-Path -LiteralPath $modelFile)) {
     & $modelscope download --model qwen/Qwen3-VL-Embedding-2B --local_dir $ModelDir
 }
 
-& $python -c "import torch; print(f'Qwen runtime ready: {torch.__version__}, CUDA={torch.cuda.is_available()}'); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+if (-not $SkipUnderstandingModelDownload) {
+    Write-Host "Caching the default local Caption and Whisper models..."
+    & $python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-VL-4B-Instruct'); from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8'); print('Caption and Whisper models cached.')"
+}
+
+& $python -c "import torch, accelerate, faster_whisper, rapidocr; print(f'PastVideo local AI runtime ready: PyTorch {torch.__version__}, CUDA={torch.cuda.is_available()}'); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 Write-Host "Model: $ModelDir"
+if ($SkipUnderstandingModelDownload) {
+    Write-Host "Caption and Whisper model weights will download on first use."
+}

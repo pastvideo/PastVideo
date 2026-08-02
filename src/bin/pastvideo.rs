@@ -10,8 +10,10 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use pastvideo::{
-    benchmark, default_embedder, qwen_embedder, server, AnalyzerOutput, Config, Database,
-    FilterPredicate, HighlightMethod, IndexDefinitionSpec, KnowledgeDatabase, StructuredQuery,
+    benchmark, default_embedder, qwen_embedder, run_local_analyzers, server,
+    split_local_analyzer_configs, AnalyzerOutput, Config, Database, EnrichmentStore,
+    FilterPredicate, HighlightMethod, IndexDefinitionSpec, KnowledgeDatabase,
+    LocalUnderstandingConfig, StructuredQuery,
 };
 
 #[derive(Parser)]
@@ -80,6 +82,42 @@ enum Command {
         /// Re-attempt chunks previously routed to the dead-letter queue.
         #[arg(long)]
         retry_failed: bool,
+    },
+
+    /// Build visual, Caption, OCR, Whisper, and fused text indexes locally.
+    Enhance {
+        /// One video file or a directory of supported videos.
+        path: PathBuf,
+        #[arg(long, default_value = "local-multimodal-v1")]
+        idempotency_key: String,
+        #[arg(long, default_value_t = 30.0)]
+        chunk_duration: f64,
+        #[arg(long, default_value_t = 5.0)]
+        overlap: f64,
+        /// Analyze only the first N visual/Caption/OCR segments per video.
+        #[arg(long)]
+        max_segments: Option<usize>,
+        #[arg(long, default_value = "small")]
+        whisper_model: String,
+        #[arg(long, default_value_t = 4)]
+        caption_frames: usize,
+        #[arg(long, default_value_t = 3)]
+        ocr_frames: usize,
+        #[arg(long)]
+        no_caption: bool,
+        #[arg(long)]
+        no_ocr: bool,
+        #[arg(long)]
+        no_transcript: bool,
+        /// Require every model to exist locally; never download missing weights.
+        #[arg(long)]
+        offline: bool,
+        /// Deterministic lightweight analyzers for automated E2E tests.
+        #[arg(long, hide = true)]
+        mock: bool,
+        /// Do not create missing visual embeddings before enrichment.
+        #[arg(long)]
+        no_visual: bool,
     },
 
     /// Search indexed footage with a natural-language query.
@@ -332,6 +370,153 @@ fn run(cli: Cli) -> Result<(), String> {
                 );
             }
         }
+        Command::Enhance {
+            path,
+            idempotency_key,
+            chunk_duration,
+            overlap,
+            max_segments,
+            whisper_model,
+            caption_frames,
+            ocr_frames,
+            no_caption,
+            no_ocr,
+            no_transcript,
+            offline,
+            mock,
+            no_visual,
+        } => {
+            let path = expand(path);
+            let videos = if path.is_dir() {
+                pastvideo::chunker::scan_directory(&path)
+            } else if path.is_file() {
+                vec![path]
+            } else {
+                return Err(format!("video or directory not found: {}", path.display()));
+            };
+            if videos.is_empty() {
+                return Err("no supported video files found".into());
+            }
+            let mut summaries = Vec::with_capacity(videos.len());
+            for (position, video) in videos.iter().enumerate() {
+                eprintln!(
+                    "Enhancing video {}/{}: {}",
+                    position + 1,
+                    videos.len(),
+                    video
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("video")
+                );
+                let visual_report = if no_visual {
+                    None
+                } else {
+                    let db = open_db(
+                        &data_dir,
+                        Config {
+                            chunk_duration,
+                            overlap,
+                            skip_still: false,
+                            ..Config::default()
+                        },
+                        backend,
+                    )?;
+                    Some(db.insert_video(video).map_err(|error| error.to_string())?)
+                };
+
+                let knowledge =
+                    KnowledgeDatabase::open(&data_dir).map_err(|error| error.to_string())?;
+                let media = knowledge
+                    .register_local_file(video)
+                    .map_err(|error| error.to_string())?;
+                let legacy = knowledge
+                    .understanding_by_key(&media.id, &idempotency_key)
+                    .map_err(|error| error.to_string())?;
+                let mut analyzer_seconds = 0.0;
+                let mut understandings = Vec::new();
+                let mut reused_analyzers = 0usize;
+                if let Some(previous) = legacy {
+                    reused_analyzers = previous.artifacts.len();
+                    understandings.push(previous);
+                } else {
+                    let mut config =
+                        LocalUnderstandingConfig::from_env().map_err(|error| error.to_string())?;
+                    config.chunk_duration = chunk_duration;
+                    config.overlap = overlap;
+                    config.max_segments = max_segments;
+                    config.whisper_model = whisper_model.clone();
+                    config.caption_frames = caption_frames;
+                    config.ocr_frames = ocr_frames;
+                    config.caption = !no_caption;
+                    config.ocr = !no_ocr;
+                    config.transcript = !no_transcript;
+                    config.offline = offline;
+                    config.mock = mock;
+                    for (analyzer, analyzer_config) in split_local_analyzer_configs(&config) {
+                        let analyzer_key = format!("{idempotency_key}:{analyzer}");
+                        if let Some(previous) = knowledge
+                            .understanding_by_key(&media.id, &analyzer_key)
+                            .map_err(|error| error.to_string())?
+                        {
+                            reused_analyzers += 1;
+                            understandings.push(previous);
+                            continue;
+                        }
+                        let report = run_local_analyzers(video, &analyzer_config)
+                            .map_err(|error| format!("{analyzer} failed: {error}"))?;
+                        analyzer_seconds += report.elapsed_seconds;
+                        let understanding = knowledge
+                            .understand(&media.id, &analyzer_key, &report.analyzers)
+                            .map_err(|error| error.to_string())?;
+                        understandings.push(understanding);
+                    }
+                }
+
+                let mut durable = Vec::new();
+                let artifacts: Vec<_> = understandings
+                    .iter()
+                    .flat_map(|understanding| understanding.artifacts.iter().cloned())
+                    .collect();
+                for artifact in &artifacts {
+                    if !matches!(
+                        artifact.artifact_type.as_str(),
+                        "scene_caption" | "ocr" | "transcript"
+                    ) {
+                        continue;
+                    }
+                    durable.push((
+                        artifact.clone(),
+                        knowledge
+                            .artifact_records(&artifact.id)
+                            .map_err(|error| error.to_string())?,
+                    ));
+                }
+                drop(knowledge);
+
+                let embedder = open_embedder(backend)?;
+                let mut enrichment =
+                    EnrichmentStore::open(&data_dir).map_err(|error| error.to_string())?;
+                let mut indexed_records = 0usize;
+                for (artifact, records) in durable {
+                    let report = enrichment
+                        .index_artifact(&media.uri, &artifact, &records, embedder.as_ref())
+                        .map_err(|error| error.to_string())?;
+                    indexed_records += report.records_indexed;
+                }
+                summaries.push(serde_json::json!({
+                    "media_id": media.id,
+                    "visual_new_chunks": visual_report.as_ref().map_or(0, |report| report.new_chunks),
+                    "understanding_ids": understandings.iter().map(|value| value.run.id.clone()).collect::<Vec<_>>(),
+                    "understanding_reused": reused_analyzers == artifacts.len(),
+                    "reused_analyzers": reused_analyzers,
+                    "analyzer_seconds": analyzer_seconds,
+                    "artifacts": artifacts,
+                    "new_enrichment_records": indexed_records,
+                    "enrichment_counts": enrichment.modality_counts().map_err(|error| error.to_string())?
+                }));
+            }
+            print_json(&serde_json::json!({"videos": summaries}))?;
+        }
         Command::Search {
             query,
             results,
@@ -342,7 +527,7 @@ fn run(cli: Cli) -> Result<(), String> {
         } => {
             let db = open_db(&data_dir, Config::default(), backend)?;
             let hits = db
-                .search_text(&query, results, dedupe)
+                .search_multimodal(&query, results, dedupe)
                 .map_err(|e| e.to_string())?;
             present(&db, &hits, output, no_trim, save_top)?;
         }
@@ -400,6 +585,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Stats => {
             let db = open_db(&data_dir, Config::default(), backend)?;
             let s = db.stats().map_err(|e| e.to_string())?;
+            let enrichment = EnrichmentStore::open(&data_dir).map_err(|e| e.to_string())?;
             if s.total_chunks == 0 {
                 println!("Index is empty. Run `pastvideo index <path>` first.");
             } else {
@@ -415,6 +601,13 @@ fn run(cli: Cli) -> Result<(), String> {
                     };
                     println!("  {f}{marker}");
                 }
+            }
+            println!(
+                "Understanding records: {}",
+                enrichment.count().map_err(|e| e.to_string())?
+            );
+            for (modality, count) in enrichment.modality_counts().map_err(|e| e.to_string())? {
+                println!("  {modality}: {count}");
             }
         }
         Command::MediaAdd { path } => {
@@ -529,8 +722,14 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Reset => {
             let db = open_db(&data_dir, Config::default(), backend)?;
+            let visual = db.stats().map_err(|error| error.to_string())?.total_chunks;
             db.reset().map_err(|e| e.to_string())?;
-            println!("Index reset.");
+            let enrichment = EnrichmentStore::open(&data_dir)
+                .and_then(|mut store| store.reset())
+                .map_err(|error| error.to_string())?;
+            println!(
+                "Index reset: {visual} visual moments and {enrichment} understanding records removed."
+            );
         }
         Command::Dlq { cmd } => {
             let db = open_db(&data_dir, Config::default(), backend)?;
@@ -586,13 +785,17 @@ fn present(
             .and_then(|s| s.to_str())
             .unwrap_or("-");
         println!(
-            "  #{} [{:.2}] {} @ {}-{}",
+            "  #{} [{:.2}] {} @ {}-{}  [{}]",
             i + 1,
             m.score,
             basename,
             fmt_t(m.start_time),
             fmt_t(m.end_time),
+            m.primary_modality,
         );
+        if let Some(evidence) = &m.evidence {
+            println!("      {evidence}");
+        }
     }
 
     if no_trim {
@@ -615,6 +818,9 @@ fn to_match(a: &pastvideo::Anomaly) -> Option<pastvideo::Match> {
         start_time: a.start_time,
         end_time: a.end_time,
         score: a.score,
+        primary_modality: "visual".into(),
+        evidence: None,
+        score_breakdown: Default::default(),
     })
 }
 

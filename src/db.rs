@@ -5,7 +5,7 @@
 //! embeds and ranks automatically. Callers never touch chunker/embedder/store
 //! directly.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -17,6 +17,7 @@ use crate::chunker::{
 };
 use crate::dlq::{DeadLetterQueue, DlqEntry};
 use crate::embedder::{default_embedder, Embedder, VideoSpan};
+use crate::enrichment::{EnrichmentHit, EnrichmentStore};
 use crate::error::{is_permanent_failure, Error, Result};
 use crate::highlights::{rank_highlights, AgainstMode, Anomaly, Method as HighlightMethod};
 use crate::search::{search_with_embedding, search_with_embedding_in_sources};
@@ -101,12 +102,18 @@ struct SpanFileProgress {
 }
 
 /// A ranked search match.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Match {
     pub source_file: String,
     pub start_time: f64,
     pub end_time: f64,
     pub score: f64,
+    #[serde(default = "visual_modality")]
+    pub primary_modality: String,
+    #[serde(default)]
+    pub evidence: Option<String>,
+    #[serde(default)]
+    pub score_breakdown: BTreeMap<String, f64>,
 }
 
 impl Match {
@@ -116,12 +123,16 @@ impl Match {
             start_time: h.start_time,
             end_time: h.end_time,
             score: h.score,
+            primary_modality: visual_modality(),
+            evidence: None,
+            score_breakdown: BTreeMap::from([("visual".into(), h.score)]),
         }
     }
 }
 
 /// The video-search database. Open one, insert footage, then query.
 pub struct Database {
+    data_dir: PathBuf,
     store: SentryStore,
     dlq: DeadLetterQueue,
     embedder: Box<dyn Embedder>,
@@ -184,6 +195,7 @@ impl Database {
 
         let dlq = DeadLetterQueue::open(&db_path)?;
         Ok(Self {
+            data_dir: dir.to_path_buf(),
             store,
             dlq,
             embedder,
@@ -198,6 +210,9 @@ impl Database {
     }
     pub fn model(&self) -> &str {
         self.embedder.model()
+    }
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
     pub fn config(&self) -> &Config {
         &self.config
@@ -1018,6 +1033,91 @@ impl Database {
         Ok(hits.iter().map(Match::from_hit).collect())
     }
 
+    /// Search visual, Caption, OCR, transcript, and exact-text indexes together.
+    /// Only source files that already have completed visual chunks are eligible.
+    pub fn search_multimodal(
+        &self,
+        query: &str,
+        n_results: usize,
+        dedupe: Option<f64>,
+    ) -> Result<Vec<Match>> {
+        let allowed: HashSet<String> = self.store.stats()?.source_files.into_iter().collect();
+        self.search_multimodal_inner(query, &allowed, n_results, dedupe)
+    }
+
+    /// Library-scoped multimodal search. Enrichment records never make an
+    /// unindexed or removed video eligible by themselves.
+    pub fn search_multimodal_in_files(
+        &self,
+        query: &str,
+        source_files: &[PathBuf],
+        n_results: usize,
+        dedupe: Option<f64>,
+    ) -> Result<Vec<Match>> {
+        let indexed: HashSet<String> = self.store.stats()?.source_files.into_iter().collect();
+        let allowed: HashSet<String> = source_files
+            .iter()
+            .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+            .map(|path| path.to_string_lossy().into_owned())
+            .filter(|path| indexed.contains(path))
+            .collect();
+        self.search_multimodal_inner(query, &allowed, n_results, dedupe)
+    }
+
+    fn search_multimodal_inner(
+        &self,
+        query: &str,
+        allowed: &HashSet<String>,
+        n_results: usize,
+        dedupe: Option<f64>,
+    ) -> Result<Vec<Match>> {
+        if allowed.is_empty() || n_results == 0 {
+            return Ok(Vec::new());
+        }
+        let embedding = self.embedder.embed_text(query)?;
+        self.validate_embedding(&embedding)?;
+        let candidate_limit = n_results.saturating_mul(8).clamp(24, 400);
+        let visual = search_with_embedding_in_sources(
+            &embedding,
+            &self.store,
+            candidate_limit,
+            dedupe,
+            Some(allowed),
+        )?;
+
+        let enrichment = EnrichmentStore::open(&self.data_dir)?;
+        if enrichment.count()? == 0 {
+            return Ok(visual.iter().take(n_results).map(Match::from_hit).collect());
+        }
+
+        let mut candidates = Vec::<FusedCandidate>::new();
+        add_visual_candidates(&mut candidates, &visual);
+        for (modality, weight) in [("scene_caption", 0.25), ("ocr", 0.15), ("transcript", 0.20)] {
+            let hits = enrichment.semantic_search(
+                &embedding,
+                self.embedder.backend(),
+                self.embedder.model(),
+                modality,
+                Some(allowed),
+                candidate_limit,
+            )?;
+            add_enrichment_candidates(&mut candidates, &hits, modality, weight, false);
+        }
+        let exact = enrichment.exact_search(query, Some(allowed), candidate_limit)?;
+        // An exact phrase observed in OCR or a transcript is stronger evidence
+        // than an approximate visual similarity. Keep semantic fusion for
+        // natural-language queries, but guarantee literal on-screen/spoken
+        // text can surface even when that moment is not a top visual candidate.
+        add_enrichment_candidates(&mut candidates, &exact, "exact_text", 0.75, true);
+
+        candidates.sort_by(|left, right| right.rrf.total_cmp(&left.rrf));
+        Ok(candidates
+            .into_iter()
+            .take(n_results)
+            .map(FusedCandidate::finish)
+            .collect())
+    }
+
     pub(crate) fn embed_texts(&self, queries: &[String]) -> Result<Vec<Vec<f32>>> {
         let embeddings = self.embedder.embed_texts(queries)?;
         if embeddings.len() != queries.len() {
@@ -1138,9 +1238,194 @@ impl Database {
     }
 }
 
+#[derive(Debug)]
+struct FusedCandidate {
+    source_file: String,
+    group_start: f64,
+    group_end: f64,
+    start_time: f64,
+    end_time: f64,
+    rrf: f64,
+    primary_priority: f64,
+    primary_modality: String,
+    evidence: Option<String>,
+    evidence_priority: f64,
+    score_breakdown: BTreeMap<String, f64>,
+}
+
+impl FusedCandidate {
+    fn from_visual(hit: &Hit, rank: usize) -> Self {
+        Self {
+            source_file: hit.source_file.clone(),
+            group_start: hit.start_time,
+            group_end: hit.end_time,
+            start_time: hit.start_time,
+            end_time: hit.end_time,
+            rrf: 0.40 / (60.0 + rank as f64),
+            primary_priority: 0.40 * hit.score,
+            primary_modality: visual_modality(),
+            evidence: None,
+            evidence_priority: 0.0,
+            score_breakdown: BTreeMap::from([("visual".into(), hit.score)]),
+        }
+    }
+
+    fn overlaps(&self, hit: &EnrichmentHit) -> bool {
+        if self.source_file != hit.source_file {
+            return false;
+        }
+        let overlap =
+            (self.group_end.min(hit.end_time) - self.group_start.max(hit.start_time)).max(0.0);
+        let shorter = (self.group_end - self.group_start)
+            .min(hit.end_time - hit.start_time)
+            .max(0.001);
+        overlap / shorter >= 0.20
+    }
+
+    fn add_enrichment(
+        &mut self,
+        hit: &EnrichmentHit,
+        modality: &str,
+        rank: usize,
+        weight: f64,
+        exact: bool,
+    ) {
+        self.group_start = self.group_start.min(hit.start_time);
+        self.group_end = self.group_end.max(hit.end_time);
+        self.rrf += weight / (60.0 + rank as f64);
+        self.score_breakdown
+            .entry(modality.to_owned())
+            .and_modify(|score| *score = score.max(hit.score))
+            .or_insert(hit.score);
+        let priority = if exact { 1.0 } else { weight * hit.score };
+        if priority > self.primary_priority {
+            self.primary_priority = priority;
+            self.primary_modality = hit.modality.clone();
+            self.start_time = hit.start_time;
+            self.end_time = hit.end_time;
+        }
+        let evidence_priority = if exact { 2.0 } else { hit.score.max(0.0) };
+        if evidence_priority > self.evidence_priority && !hit.text.trim().is_empty() {
+            self.evidence_priority = evidence_priority;
+            self.evidence = Some(truncate_evidence(&hit.text));
+        }
+    }
+
+    fn from_enrichment(
+        hit: &EnrichmentHit,
+        modality: &str,
+        rank: usize,
+        weight: f64,
+        exact: bool,
+    ) -> Self {
+        let priority = if exact { 1.0 } else { weight * hit.score };
+        Self {
+            source_file: hit.source_file.clone(),
+            group_start: hit.start_time,
+            group_end: hit.end_time,
+            start_time: hit.start_time,
+            end_time: hit.end_time,
+            rrf: weight / (60.0 + rank as f64),
+            primary_priority: priority,
+            primary_modality: hit.modality.clone(),
+            evidence: (!hit.text.trim().is_empty()).then(|| truncate_evidence(&hit.text)),
+            evidence_priority: if exact { 2.0 } else { hit.score.max(0.0) },
+            score_breakdown: BTreeMap::from([(modality.to_owned(), hit.score)]),
+        }
+    }
+
+    fn finish(self) -> Match {
+        Match {
+            source_file: self.source_file,
+            start_time: self.start_time,
+            end_time: self.end_time,
+            score: (self.rrf * 61.0).clamp(0.0, 1.0),
+            primary_modality: self.primary_modality,
+            evidence: self.evidence,
+            score_breakdown: self.score_breakdown,
+        }
+    }
+}
+
+fn add_visual_candidates(candidates: &mut Vec<FusedCandidate>, hits: &[Hit]) {
+    for (index, hit) in hits.iter().enumerate() {
+        candidates.push(FusedCandidate::from_visual(hit, index + 1));
+    }
+}
+
+fn add_enrichment_candidates(
+    candidates: &mut Vec<FusedCandidate>,
+    hits: &[EnrichmentHit],
+    modality: &str,
+    weight: f64,
+    exact: bool,
+) {
+    for (index, hit) in hits.iter().enumerate() {
+        if let Some(candidate) = candidates
+            .iter_mut()
+            .find(|candidate| candidate.overlaps(hit))
+        {
+            candidate.add_enrichment(hit, modality, index + 1, weight, exact);
+        } else {
+            candidates.push(FusedCandidate::from_enrichment(
+                hit,
+                modality,
+                index + 1,
+                weight,
+                exact,
+            ));
+        }
+    }
+}
+
+fn visual_modality() -> String {
+    "visual".into()
+}
+
+fn truncate_evidence(text: &str) -> String {
+    let mut value: String = text.chars().take(240).collect();
+    if text.chars().count() > 240 {
+        value.push('…');
+    }
+    value
+}
+
 fn fmt_t(seconds: f64) -> String {
     let total = seconds.round() as i64;
     let m = total / 60;
     let s = total % 60;
     format!("{m:02}m{s:02}s")
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+
+    #[test]
+    fn exact_observed_text_outranks_the_best_visual_only_candidate() {
+        let visual = Hit {
+            source_file: "visual.mp4".into(),
+            start_time: 0.0,
+            end_time: 30.0,
+            score: 1.0,
+            distance: 0.0,
+            embedding: None,
+        };
+        let exact = EnrichmentHit {
+            source_file: "text.mp4".into(),
+            media_id: "media-text".into(),
+            modality: "ocr".into(),
+            start_time: 300.0,
+            end_time: 330.0,
+            text: "Dubbing Support".into(),
+            score: 1.0,
+            exact: true,
+        };
+
+        let visual = FusedCandidate::from_visual(&visual, 1);
+        let exact = FusedCandidate::from_enrichment(&exact, "exact_text", 1, 0.75, true);
+
+        assert!(exact.rrf > visual.rrf);
+        assert_eq!(exact.primary_modality, "ocr");
+    }
 }

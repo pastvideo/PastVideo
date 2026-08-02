@@ -23,7 +23,10 @@ use crate::catalog::{
 };
 use crate::chunker::find_ffmpeg;
 use crate::provider::{create_embedder, EmbeddingProvider, EmbeddingSettings};
-use crate::{Config, Database, IndexProgress, IndexReport, Match, SharedEmbedder};
+use crate::{
+    run_local_analyzers, split_local_analyzer_configs, Config, Database, EnrichmentStore,
+    IndexProgress, IndexReport, KnowledgeDatabase, LocalUnderstandingConfig, Match, SharedEmbedder,
+};
 
 const INK: Color32 = Color32::from_rgb(13, 15, 15);
 const PANEL: Color32 = Color32::from_rgb(20, 23, 22);
@@ -76,6 +79,7 @@ struct Preferences {
 enum TaskKind {
     Scanning,
     Indexing,
+    Understanding,
     ClearingIndex,
     TestingProvider,
 }
@@ -85,6 +89,7 @@ impl TaskKind {
         match self {
             Self::Scanning => "Scanning library",
             Self::Indexing => "Indexing videos",
+            Self::Understanding => "Understanding videos",
             Self::ClearingIndex => "Clearing index",
             Self::TestingProvider => "Testing connection",
         }
@@ -111,9 +116,11 @@ enum WorkerMessage {
         error: String,
     },
     IndexProgress(IndexProgress),
+    UnderstandingProgress(UnderstandingProgress),
     CategoriesUpdated(HashMap<String, String>),
     IndexFinished(std::result::Result<IndexOutcome, String>),
-    IndexCleared(std::result::Result<i64, String>),
+    UnderstandingFinished(std::result::Result<UnderstandingOutcome, String>),
+    IndexCleared(std::result::Result<(i64, i64), String>),
     SearchFinished(std::result::Result<Vec<Match>, String>),
     ProviderTestFinished(std::result::Result<String, String>),
     SegmentExportFinished(std::result::Result<PathBuf, String>),
@@ -122,6 +129,28 @@ enum WorkerMessage {
 struct IndexOutcome {
     report: IndexReport,
     categories: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct UnderstandingProgress {
+    files_completed: usize,
+    files_total: usize,
+    current_file: PathBuf,
+    artifacts_completed: usize,
+    records_indexed: usize,
+    reused_videos: usize,
+    failed_videos: usize,
+    current_stage: String,
+}
+
+struct UnderstandingOutcome {
+    files_completed: usize,
+    files_total: usize,
+    artifacts_completed: usize,
+    records_indexed: usize,
+    reused_videos: usize,
+    failed_videos: usize,
+    cancelled: bool,
 }
 
 struct MatchPlayer {
@@ -198,6 +227,8 @@ pub struct PastVideoApp {
     shared_embedder: Option<SharedEmbedder>,
     index_cancel: Option<Arc<AtomicBool>>,
     index_progress: Option<IndexProgress>,
+    understanding_cancel: Option<Arc<AtomicBool>>,
+    understanding_progress: Option<UnderstandingProgress>,
     notice: Option<(String, bool)>,
     settings_open: bool,
     clear_index_confirm: bool,
@@ -256,6 +287,8 @@ impl PastVideoApp {
             shared_embedder: None,
             index_cancel: None,
             index_progress: None,
+            understanding_cancel: None,
+            understanding_progress: None,
             notice: None,
             settings_open: false,
             clear_index_confirm: false,
@@ -773,6 +806,247 @@ impl PastVideoApp {
         }
     }
 
+    fn start_understanding(&mut self) {
+        if self.task.is_some() {
+            return;
+        }
+        if self.preferences.folders.is_empty() || self.videos.is_empty() {
+            self.notice = Some(("Add and index a video folder first.".into(), true));
+            return;
+        }
+        let settings = self.preferences.embedding.clone();
+        let embedder = match self.get_shared_embedder(&settings) {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                self.notice = Some((friendly_error(&error), true));
+                return;
+            }
+        };
+        let data_dir = self.data_dir(&settings);
+        let videos: Vec<PathBuf> = self.videos.iter().map(|video| video.path.clone()).collect();
+        let tx = self.tx.clone();
+        let repaint = self.repaint.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.task = Some(TaskKind::Understanding);
+        self.understanding_cancel = Some(Arc::clone(&cancel));
+        self.understanding_progress = None;
+        self.notice = Some((
+            "Starting local Caption, OCR, and speech understanding...".into(),
+            false,
+        ));
+        thread::spawn(move || {
+            let result = (|| -> std::result::Result<UnderstandingOutcome, String> {
+                let indexed_sources: HashSet<String> =
+                    Database::with_embedder(&data_dir, embedder.boxed())
+                        .map_err(|error| error.to_string())?
+                        .stats()
+                        .map_err(|error| error.to_string())?
+                        .source_files
+                        .into_iter()
+                        .collect();
+                let candidates: Vec<PathBuf> = videos
+                    .into_iter()
+                    .filter(|path| {
+                        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                        indexed_sources.contains(&canonical.to_string_lossy().to_string())
+                    })
+                    .collect();
+                if candidates.is_empty() {
+                    return Err(
+                        "No visually indexed videos are ready. Run Index new videos first.".into(),
+                    );
+                }
+
+                let mut enrichment =
+                    EnrichmentStore::open(&data_dir).map_err(|error| error.to_string())?;
+                let mut outcome = UnderstandingOutcome {
+                    files_completed: 0,
+                    files_total: candidates.len(),
+                    artifacts_completed: 0,
+                    records_indexed: 0,
+                    reused_videos: 0,
+                    failed_videos: 0,
+                    cancelled: false,
+                };
+                for video in candidates {
+                    if cancel.load(Ordering::Acquire) {
+                        outcome.cancelled = true;
+                        break;
+                    }
+                    let _ = tx.send(WorkerMessage::UnderstandingProgress(
+                        UnderstandingProgress {
+                            files_completed: outcome.files_completed,
+                            files_total: outcome.files_total,
+                            current_file: video.clone(),
+                            artifacts_completed: outcome.artifacts_completed,
+                            records_indexed: outcome.records_indexed,
+                            reused_videos: outcome.reused_videos,
+                            failed_videos: outcome.failed_videos,
+                            current_stage: "Preparing analyzers".into(),
+                        },
+                    ));
+                    repaint.request_repaint();
+
+                    let processed =
+                        (|| -> std::result::Result<(usize, usize, bool, usize), String> {
+                            let knowledge = KnowledgeDatabase::open(&data_dir)
+                                .map_err(|error| error.to_string())?;
+                            let media = knowledge
+                                .register_local_file(&video)
+                                .map_err(|error| error.to_string())?;
+                            let legacy = knowledge
+                                .understanding_by_key(&media.id, "desktop-local-understanding-v1")
+                                .map_err(|error| error.to_string())?;
+                            let mut understandings = Vec::new();
+                            let mut reused_analyzers = 0usize;
+                            let mut analyzer_failures = 0usize;
+                            let requested_analyzers;
+                            if let Some(previous) = legacy {
+                                requested_analyzers = previous.artifacts.len();
+                                reused_analyzers = requested_analyzers;
+                                understandings.push(previous);
+                            } else {
+                                let config = LocalUnderstandingConfig::from_env()
+                                    .map_err(|error| error.to_string())?;
+                                let jobs = split_local_analyzer_configs(&config);
+                                requested_analyzers = jobs.len();
+                                for (analyzer, analyzer_config) in jobs {
+                                    if cancel.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    let _ = tx.send(WorkerMessage::UnderstandingProgress(
+                                        UnderstandingProgress {
+                                            files_completed: outcome.files_completed,
+                                            files_total: outcome.files_total,
+                                            current_file: video.clone(),
+                                            artifacts_completed: outcome.artifacts_completed,
+                                            records_indexed: outcome.records_indexed,
+                                            reused_videos: outcome.reused_videos,
+                                            failed_videos: outcome.failed_videos,
+                                            current_stage: analyzer_stage_label(analyzer).into(),
+                                        },
+                                    ));
+                                    repaint.request_repaint();
+                                    let analyzer_key =
+                                        format!("desktop-local-understanding-v1:{analyzer}");
+                                    match knowledge
+                                        .understanding_by_key(&media.id, &analyzer_key)
+                                        .map_err(|error| error.to_string())?
+                                    {
+                                        Some(previous) => {
+                                            reused_analyzers += 1;
+                                            understandings.push(previous);
+                                        }
+                                        None => {
+                                            match run_local_analyzers(&video, &analyzer_config) {
+                                                Ok(report) => match knowledge.understand(
+                                                    &media.id,
+                                                    &analyzer_key,
+                                                    &report.analyzers,
+                                                ) {
+                                                    Ok(understanding) => {
+                                                        understandings.push(understanding)
+                                                    }
+                                                    Err(error) => {
+                                                        analyzer_failures += 1;
+                                                        eprintln!(
+                                                        "PastVideo {analyzer} commit failed for {}: {error}",
+                                                        video.display()
+                                                    );
+                                                    }
+                                                },
+                                                Err(error) => {
+                                                    analyzer_failures += 1;
+                                                    eprintln!(
+                                                    "PastVideo {analyzer} failed for {}: {error}",
+                                                    video.display()
+                                                );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let mut indexed_records = 0usize;
+                            let mut artifacts = 0usize;
+                            for artifact in understandings
+                                .iter()
+                                .flat_map(|understanding| understanding.artifacts.iter())
+                            {
+                                if !matches!(
+                                    artifact.artifact_type.as_str(),
+                                    "scene_caption" | "ocr" | "transcript"
+                                ) {
+                                    continue;
+                                }
+                                let records = knowledge
+                                    .artifact_records(&artifact.id)
+                                    .map_err(|error| error.to_string())?;
+                                indexed_records += enrichment
+                                    .index_artifact(&media.uri, artifact, &records, &embedder)
+                                    .map_err(|error| error.to_string())?
+                                    .records_indexed;
+                                artifacts += 1;
+                            }
+                            Ok((
+                                artifacts,
+                                indexed_records,
+                                reused_analyzers == requested_analyzers,
+                                analyzer_failures,
+                            ))
+                        })();
+
+                    outcome.files_completed += 1;
+                    match processed {
+                        Ok((artifacts, records, reused, analyzer_failures)) => {
+                            outcome.artifacts_completed += artifacts;
+                            outcome.records_indexed += records;
+                            outcome.reused_videos += usize::from(reused);
+                            outcome.failed_videos += usize::from(analyzer_failures > 0);
+                        }
+                        Err(error) => {
+                            outcome.failed_videos += 1;
+                            eprintln!(
+                                "PastVideo could not understand {}: {error}",
+                                video.display()
+                            );
+                        }
+                    }
+                    let _ = tx.send(WorkerMessage::UnderstandingProgress(
+                        UnderstandingProgress {
+                            files_completed: outcome.files_completed,
+                            files_total: outcome.files_total,
+                            current_file: video,
+                            artifacts_completed: outcome.artifacts_completed,
+                            records_indexed: outcome.records_indexed,
+                            reused_videos: outcome.reused_videos,
+                            failed_videos: outcome.failed_videos,
+                            current_stage: "Committed".into(),
+                        },
+                    ));
+                    repaint.request_repaint();
+                }
+                Ok(outcome)
+            })();
+            let _ = tx.send(WorkerMessage::UnderstandingFinished(result));
+            repaint.request_repaint();
+        });
+    }
+
+    fn stop_understanding(&mut self) {
+        if self.task != Some(TaskKind::Understanding) {
+            return;
+        }
+        if let Some(cancel) = self.understanding_cancel.as_ref() {
+            if !cancel.swap(true, Ordering::AcqRel) {
+                self.notice = Some((
+                    "Stopping after the current video. Completed understanding is kept.".into(),
+                    false,
+                ));
+            }
+        }
+    }
+
     fn start_search(&mut self) {
         let query = self.search_query.trim().to_string();
         if query.is_empty() {
@@ -806,7 +1080,7 @@ impl PastVideoApp {
             let result = (|| -> std::result::Result<Vec<Match>, String> {
                 let db = Database::with_embedder(&data_dir, embedder.boxed())
                     .map_err(|error| error.to_string())?;
-                db.search_text_in_files(&query, &candidate_files, 48, Some(0.985))
+                db.search_multimodal_in_files(&query, &candidate_files, 48, Some(0.985))
                     .map_err(|error| error.to_string())
             })();
             let _ = tx.send(WorkerMessage::SearchFinished(result));
@@ -887,16 +1161,19 @@ impl PastVideoApp {
         self.clear_index_confirm = false;
         self.notice = None;
         thread::spawn(move || {
-            let result = (|| -> std::result::Result<i64, String> {
+            let result = (|| -> std::result::Result<(i64, i64), String> {
                 let db = Database::with_embedder(&data_dir, embedder.boxed())
                     .map_err(|error| error.to_string())?;
                 let moments = db.stats().map_err(|error| error.to_string())?.total_chunks;
                 db.reset().map_err(|error| error.to_string())?;
+                let enrichment_records = EnrichmentStore::open(&data_dir)
+                    .and_then(|mut enrichment| enrichment.reset())
+                    .map_err(|error| error.to_string())?;
                 if categories_path.is_file() {
                     fs::remove_file(&categories_path)
                         .map_err(|error| format!("could not clear saved categories: {error}"))?;
                 }
-                Ok(moments)
+                Ok((moments, enrichment_records))
             })();
             let _ = tx.send(WorkerMessage::IndexCleared(result));
         });
@@ -1096,6 +1373,9 @@ impl PastVideoApp {
                 WorkerMessage::IndexProgress(progress) => {
                     self.index_progress = Some(progress);
                 }
+                WorkerMessage::UnderstandingProgress(progress) => {
+                    self.understanding_progress = Some(progress);
+                }
                 WorkerMessage::CategoriesUpdated(categories) => {
                     apply_categories(&mut self.videos, &categories);
                 }
@@ -1126,11 +1406,38 @@ impl PastVideoApp {
                         Err(error) => self.notice = Some((friendly_error(&error), true)),
                     }
                 }
+                WorkerMessage::UnderstandingFinished(result) => {
+                    self.task = None;
+                    self.understanding_cancel = None;
+                    self.understanding_progress = None;
+                    match result {
+                        Ok(outcome) => {
+                            let action = if outcome.cancelled {
+                                "Understanding stopped"
+                            } else {
+                                "Understanding finished"
+                            };
+                            self.notice = Some((
+                                format!(
+                                    "{action}. {}/{} videos, {} artifacts, {} new searchable records, {} reused, {} failed.",
+                                    outcome.files_completed,
+                                    outcome.files_total,
+                                    outcome.artifacts_completed,
+                                    outcome.records_indexed,
+                                    outcome.reused_videos,
+                                    outcome.failed_videos,
+                                ),
+                                outcome.failed_videos > 0,
+                            ));
+                        }
+                        Err(error) => self.notice = Some((friendly_error(&error), true)),
+                    }
+                }
                 WorkerMessage::IndexCleared(result) => {
                     self.task = None;
                     self.index_progress = None;
                     match result {
-                        Ok(moments) => {
+                        Ok((moments, enrichment_records)) => {
                             self.close_player();
                             self.search_query.clear();
                             self.searched_query = None;
@@ -1142,7 +1449,7 @@ impl PastVideoApp {
                             }
                             self.notice = Some((
                                 format!(
-                                    "Cleared {moments} indexed moments. Source videos were not changed."
+                                    "Cleared {moments} visual moments and {enrichment_records} understanding records. Source videos were not changed."
                                 ),
                                 false,
                             ));
@@ -1641,6 +1948,19 @@ impl PastVideoApp {
             .size(11.0)
             .color(MUTED),
         );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!(
+                "FOUND BY {}",
+                modality_label(&selected_match.primary_modality)
+            ))
+            .monospace()
+            .size(9.0)
+            .color(SIGNAL),
+        );
+        if let Some(evidence) = selected_match.evidence.as_deref() {
+            ui.label(RichText::new(evidence).size(11.0).color(CREAM));
+        }
         ui.add_space(20.0);
         self.show_playback_controls(ui, selected_match, PlaybackKind::MatchedClip);
         let export_label = if self.segment_exporting {
@@ -2001,6 +2321,73 @@ impl PastVideoApp {
         );
     }
 
+    fn show_understanding_progress(&self, ui: &mut egui::Ui) {
+        let stopping = self
+            .understanding_cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Acquire));
+        let Some(progress) = self.understanding_progress.as_ref() else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new(if stopping {
+                        "Stopping understanding..."
+                    } else {
+                        "Preparing local Caption, OCR, and Whisper..."
+                    })
+                    .size(11.0)
+                    .color(SIGNAL),
+                );
+            });
+            return;
+        };
+        let fraction = if progress.files_total == 0 {
+            0.0
+        } else {
+            progress.files_completed as f32 / progress.files_total as f32
+        };
+        let file_name = progress
+            .current_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Video");
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{}  ·  {}/{} VIDEOS  ·  {} ARTIFACTS  ·  {} SEARCH RECORDS",
+                    if stopping {
+                        "STOPPING"
+                    } else {
+                        "UNDERSTANDING"
+                    },
+                    progress.files_completed,
+                    progress.files_total,
+                    progress.artifacts_completed,
+                    progress.records_indexed,
+                ))
+                .monospace()
+                .size(10.0)
+                .strong()
+                .color(SIGNAL),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} reused · {} failed",
+                        progress.reused_videos, progress.failed_videos
+                    ))
+                    .size(10.0)
+                    .color(MUTED),
+                );
+            });
+        });
+        ui.add(
+            egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                .desired_width(ui.available_width())
+                .text(format!("{file_name} · {}", progress.current_stage)),
+        );
+    }
+
     fn show_library(&mut self, ui: &mut egui::Ui) {
         let indices = self.filtered_video_indices();
         ui.horizontal(|ui| {
@@ -2057,6 +2444,45 @@ impl PastVideoApp {
                         self.stop_index();
                     } else {
                         self.start_index();
+                    }
+                }
+                let understanding = self.task == Some(TaskKind::Understanding);
+                let understanding_stopping = self
+                    .understanding_cancel
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.load(Ordering::Acquire));
+                let understanding_label = if understanding_stopping {
+                    "Stopping..."
+                } else if understanding {
+                    "■ Stop understanding"
+                } else {
+                    "Understand content"
+                };
+                if ui
+                    .add_enabled(
+                        if understanding {
+                            !understanding_stopping
+                        } else {
+                            self.task.is_none() && !self.videos.is_empty()
+                        },
+                        egui::Button::new(
+                            RichText::new(understanding_label).strong().color(CREAM),
+                        )
+                        .fill(if understanding {
+                            Color32::from_rgb(120, 47, 35)
+                        } else {
+                            PANEL_RAISED
+                        }),
+                    )
+                    .on_hover_text(
+                        "Create local scene descriptions, screen text, and speech transcripts for visually indexed videos.",
+                    )
+                    .clicked()
+                {
+                    if understanding {
+                        self.stop_understanding();
+                    } else {
+                        self.start_understanding();
                     }
                 }
                 ui.label(
@@ -2225,7 +2651,7 @@ impl PastVideoApp {
                 "Try a broader description or index your library first.",
             );
         } else {
-            let row_height = 108.0;
+            let row_height = 126.0;
             let result_count = self.search_results.len();
             egui::ScrollArea::vertical()
                 .id_salt("semantic_results")
@@ -2269,14 +2695,16 @@ impl PastVideoApp {
                                                     .color(if selected { INK } else { MUTED }),
                                             );
                                             ui.label(
-                                                RichText::new("MATCHED CLIP")
-                                                    .monospace()
-                                                    .size(8.0)
-                                                    .color(if selected {
-                                                        Color32::DARK_GRAY
-                                                    } else {
-                                                        SIGNAL
-                                                    }),
+                                                RichText::new(modality_label(
+                                                    &result.primary_modality,
+                                                ))
+                                                .monospace()
+                                                .size(8.0)
+                                                .color(if selected {
+                                                    Color32::DARK_GRAY
+                                                } else {
+                                                    SIGNAL
+                                                }),
                                             );
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -2319,6 +2747,20 @@ impl PastVideoApp {
                                                 if selected { Color32::DARK_GRAY } else { MUTED },
                                             ),
                                         );
+                                        if let Some(evidence) = result.evidence.as_deref() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(evidence).size(10.0).color(
+                                                        if selected {
+                                                            Color32::DARK_GRAY
+                                                        } else {
+                                                            MUTED
+                                                        },
+                                                    ),
+                                                )
+                                                .truncate(),
+                                            );
+                                        }
                                     });
                                 });
                             })
@@ -2615,6 +3057,8 @@ impl eframe::App for PastVideoApp {
                     if task != TaskKind::Scanning {
                         if task == TaskKind::Indexing {
                             self.show_index_progress(ui);
+                        } else if task == TaskKind::Understanding {
+                            self.show_understanding_progress(ui);
                         } else {
                             ui.horizontal(|ui| {
                                 ui.spinner();
@@ -2865,12 +3309,33 @@ fn same_match(left: &Match, right: &Match) -> bool {
         && (left.end_time - right.end_time).abs() < 0.01
 }
 
+fn modality_label(modality: &str) -> &'static str {
+    match modality {
+        "scene_caption" => "SCENE DESCRIPTION",
+        "ocr" => "SCREEN TEXT",
+        "transcript" => "SPEECH TRANSCRIPT",
+        _ => "VISUAL MATCH",
+    }
+}
+
+fn analyzer_stage_label(analyzer: &str) -> &'static str {
+    match analyzer {
+        "scene_caption" => "Generating scene descriptions",
+        "ocr" => "Reading on-screen text",
+        "transcript" => "Transcribing speech",
+        _ => "Understanding content",
+    }
+}
+
 fn playback_for_video(video: &VideoInfo) -> Match {
     Match {
         source_file: video.path.to_string_lossy().to_string(),
         start_time: 0.0,
         end_time: video.duration_seconds.unwrap_or(0.0).max(0.0),
         score: 0.0,
+        primary_modality: "visual".into(),
+        evidence: None,
+        score_breakdown: Default::default(),
     }
 }
 
@@ -3463,6 +3928,9 @@ mod tests {
             start_time: 25.0,
             end_time: 55.0,
             score: 0.9,
+            primary_modality: "visual".into(),
+            evidence: None,
+            score_breakdown: Default::default(),
         };
 
         assert_eq!(match_preview_time(&hit), 40.0);
