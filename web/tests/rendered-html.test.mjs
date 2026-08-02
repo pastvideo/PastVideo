@@ -3,7 +3,7 @@ import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 import { prefixStaticAssets } from "../scripts/static-html.mjs";
 
-process.env.NEXT_PUBLIC_PASTVIDEO_BASE = "/pastvideo_demo";
+process.env.NEXT_PUBLIC_PASTVIDEO_BASE = "/pastvideo";
 
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -47,8 +47,8 @@ test("server-renders the PastVideo search shell and social metadata", async () =
   assert.match(html, /people flying a kite/);
   assert.match(html, /an athlete doing the high jump/);
   assert.match(html, /a marching band/);
-  assert.match(html, /property="og:image" content="\/pastvideo_demo\/pastvideo-social\.png"/);
-  assert.match(html, /\/pastvideo_demo\/assets\//);
+  assert.match(html, /property="og:image" content="\/pastvideo\/pastvideo-social\.png"/);
+  assert.match(html, /\/pastvideo\/assets\//);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/);
 });
 

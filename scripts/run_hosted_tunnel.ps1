@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$Remote = "flowbehappy@claw9d.com",
+    [Parameter(Mandatory = $true)]
+    [string]$Remote,
+    [Parameter(Mandatory = $true)]
+    [string]$KnownHosts,
     [int]$RemotePort = 38787,
     [int]$LocalPort = 8787
 )
@@ -8,11 +11,15 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LogDir = Join-Path $RepoRoot ".tools"
-$KnownHosts = Join-Path $RepoRoot "scripts\claw9d_known_hosts"
+$KnownHostsPath = if ([System.IO.Path]::IsPathRooted($KnownHosts)) {
+    $KnownHosts
+} else {
+    Join-Path $RepoRoot $KnownHosts
+}
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-if (-not (Test-Path -LiteralPath $KnownHosts)) {
-    throw "Pinned SSH host key file not found: $KnownHosts"
+if (-not (Test-Path -LiteralPath $KnownHostsPath)) {
+    throw "Pinned SSH host key file not found: $KnownHostsPath"
 }
 
 while ($true) {
@@ -23,7 +30,7 @@ while ($true) {
         -o ServerAliveInterval=30 `
         -o ServerAliveCountMax=3 `
         -o StrictHostKeyChecking=yes `
-        -o "UserKnownHostsFile=$KnownHosts" `
+        -o "UserKnownHostsFile=$KnownHostsPath" `
         -R "127.0.0.1:$RemotePort`:127.0.0.1:$LocalPort" `
         $Remote `
         1>> (Join-Path $LogDir "hosted-tunnel.log") `

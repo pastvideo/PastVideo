@@ -346,12 +346,6 @@ cargo run --release -- --data-dir .tools\benchmark-data benchmark `
   --output .tools\qwen-benchmark.md
 ```
 
-## Demo
-
-The optional hosted browser demo is available at
-[moni.claw9d.com/pastvideo_demo](https://moni.claw9d.com/pastvideo_demo/). It may
-be offline when the backing GPU workstation is unavailable.
-
 ## Roadmap
 
 - Windows desktop packaging and performance hardening
