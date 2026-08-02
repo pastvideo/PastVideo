@@ -39,11 +39,15 @@ impl QwenInstallStatus {
 }
 
 pub fn managed_ai_root() -> PathBuf {
-    dirs::data_local_dir()
-        .or_else(dirs::data_dir)
-        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .join("PastVideo")
-        .join("ai")
+    env::var_os("PASTVIDEO_AI_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .or_else(dirs::data_dir)
+                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                .join("PastVideo")
+                .join("ai")
+        })
 }
 
 pub fn managed_runtime_dir() -> PathBuf {

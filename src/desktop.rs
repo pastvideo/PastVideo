@@ -142,6 +142,12 @@ enum ModelInstallSource {
     Local(PathBuf),
 }
 
+enum RuntimeInstallSource {
+    None,
+    Download,
+    Local(Vec<PathBuf>),
+}
+
 struct MatchPlayer {
     hit: Match,
     kind: PlaybackKind,
@@ -701,7 +707,11 @@ impl PastVideoApp {
         distribution::install_status(self.preferences.embedding.local_model_path.as_deref())
     }
 
-    fn start_ai_install(&mut self, install_runtime: bool, model_source: ModelInstallSource) {
+    fn start_ai_install(
+        &mut self,
+        runtime_source: RuntimeInstallSource,
+        model_source: ModelInstallSource,
+    ) {
         if self.ai_installing {
             return;
         }
@@ -716,9 +726,16 @@ impl PastVideoApp {
                     let _ = tx.send(WorkerMessage::AiInstallProgress(progress));
                     repaint.request_repaint();
                 };
-                if install_runtime {
-                    distribution::download_and_install_runtime(&mut report)
-                        .map_err(|error| error.to_string())?;
+                match runtime_source {
+                    RuntimeInstallSource::None => {}
+                    RuntimeInstallSource::Download => {
+                        distribution::download_and_install_runtime(&mut report)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    RuntimeInstallSource::Local(paths) => {
+                        distribution::install_downloaded_runtime_archives(&paths, &mut report)
+                            .map_err(|error| error.to_string())?;
+                    }
                 }
                 let model_path = match model_source {
                     ModelInstallSource::None => None,
@@ -1282,10 +1299,13 @@ impl PastVideoApp {
                             self.ai_install_progress = None;
                             self.ai_install_error = None;
                             self.persist();
-                            self.notice = Some((
-                                text(self.preferences.language, "install_complete").into(),
-                                false,
-                            ));
+                            let key = if self.local_ai_status().ready() {
+                                "install_complete"
+                            } else {
+                                "install_partial_complete"
+                            };
+                            self.notice =
+                                Some((text(self.preferences.language, key).into(), false));
                         }
                         Err(error) => {
                             self.ai_install_error = Some(error);
@@ -2767,6 +2787,7 @@ impl PastVideoApp {
         let mut download_runtime = false;
         let mut download_model = false;
         let mut download_all = false;
+        let mut choose_runtime = false;
         let mut choose_model = false;
         let mut continue_index = false;
         let mut close_requested = false;
@@ -2881,6 +2902,16 @@ impl PastVideoApp {
                         .color(MUTED),
                 );
                 ui.horizontal_wrapped(|ui| {
+                    if !runtime_ready
+                        && ui
+                            .add_enabled(
+                                !self.ai_installing,
+                                egui::Button::new(text(language, "use_downloaded_runtime")),
+                            )
+                            .clicked()
+                    {
+                        choose_runtime = true;
+                    }
                     if ui
                         .add_enabled(
                             !self.ai_installing,
@@ -2932,25 +2963,37 @@ impl PastVideoApp {
 
         self.ai_setup_open = open && !close_requested;
         if download_runtime {
-            self.start_ai_install(true, ModelInstallSource::None);
+            self.start_ai_install(RuntimeInstallSource::Download, ModelInstallSource::None);
         } else if download_model {
-            self.start_ai_install(false, ModelInstallSource::Download);
+            self.start_ai_install(RuntimeInstallSource::None, ModelInstallSource::Download);
         } else if download_all {
             self.start_ai_install(
-                !runtime_ready,
+                if runtime_ready {
+                    RuntimeInstallSource::None
+                } else {
+                    RuntimeInstallSource::Download
+                },
                 if model_ready {
                     ModelInstallSource::None
                 } else {
                     ModelInstallSource::Download
                 },
             );
+        } else if choose_runtime {
+            if let Some(paths) = rfd::FileDialog::new()
+                .set_title(text(language, "select_runtime"))
+                .add_filter("ZIP archives", &["zip"])
+                .pick_files()
+            {
+                self.start_ai_install(RuntimeInstallSource::Local(paths), ModelInstallSource::None);
+            }
         } else if choose_model {
             if let Some(path) = rfd::FileDialog::new()
                 .set_title(text(language, "select_model"))
                 .add_filter("SafeTensors", &["safetensors"])
                 .pick_file()
             {
-                self.start_ai_install(false, ModelInstallSource::Local(path));
+                self.start_ai_install(RuntimeInstallSource::None, ModelInstallSource::Local(path));
             }
         }
         if continue_index {
@@ -3356,6 +3399,8 @@ fn format_download_progress(completed: u64, total: Option<u64>) -> String {
 fn localized_download_stage(language: Language, stage: &str) -> String {
     let prefix = if stage.starts_with("Downloading") {
         text(language, "downloading")
+    } else if stage.starts_with("Checking") {
+        text(language, "checking")
     } else if stage.starts_with("Verifying") {
         text(language, "verifying")
     } else if stage.starts_with("Extracting") {
