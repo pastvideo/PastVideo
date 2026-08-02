@@ -14,6 +14,144 @@ use crate::error::{Error, Result};
 pub const BACKEND: &str = "qwen3-vl";
 pub const MODEL: &str = "Qwen3-VL-Embedding-2B-v1";
 pub const DIMENSIONS: usize = 2048;
+pub const MODEL_DIRECTORY: &str = "Qwen3-VL-Embedding-2B";
+pub const MODEL_WEIGHT_FILE: &str = "model.safetensors";
+
+#[derive(Debug, Clone)]
+pub struct QwenInstallStatus {
+    pub python: Option<PathBuf>,
+    pub model_path: Option<PathBuf>,
+    pub worker_script: Option<PathBuf>,
+}
+
+impl QwenInstallStatus {
+    pub fn runtime_ready(&self) -> bool {
+        self.python.is_some() && self.worker_script.is_some()
+    }
+
+    pub fn model_ready(&self) -> bool {
+        self.model_path.is_some()
+    }
+
+    pub fn ready(&self) -> bool {
+        self.runtime_ready() && self.model_ready()
+    }
+}
+
+pub fn managed_ai_root() -> PathBuf {
+    dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join("PastVideo")
+        .join("ai")
+}
+
+pub fn managed_runtime_dir() -> PathBuf {
+    managed_ai_root().join("runtime")
+}
+
+pub fn managed_model_dir() -> PathBuf {
+    managed_ai_root().join("models").join(MODEL_DIRECTORY)
+}
+
+pub fn packaged_app_dir() -> Option<PathBuf> {
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+pub fn qwen_install_status(model_override: Option<&Path>) -> QwenInstallStatus {
+    let home = home_dir();
+    let packaged = packaged_app_dir();
+    let managed_runtime = managed_runtime_dir();
+    let allow_legacy = !env_flag("PASTVIDEO_DISABLE_LEGACY_AI");
+
+    let python = env::var_os("PASTVIDEO_QWEN_PYTHON")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            first_file([
+                managed_runtime.join("python/python.exe"),
+                packaged
+                    .as_ref()
+                    .map(|root| root.join("runtime/python/python.exe"))
+                    .unwrap_or_default(),
+                if allow_legacy && cfg!(windows) {
+                    home.join(".venvs/qwen3-vl-cu128/Scripts/python.exe")
+                } else if allow_legacy {
+                    home.join(".venvs/qwen3-vl/bin/python")
+                } else {
+                    PathBuf::new()
+                },
+            ])
+        });
+    let model_path = env::var_os("PASTVIDEO_QWEN_MODEL")
+        .map(PathBuf::from)
+        .filter(|path| valid_model_dir(path))
+        .or_else(|| {
+            model_override
+                .filter(|path| valid_model_dir(path))
+                .map(Path::to_path_buf)
+        })
+        .or_else(|| {
+            first_model_dir([
+                managed_model_dir(),
+                packaged
+                    .as_ref()
+                    .map(|root| root.join("model").join(MODEL_DIRECTORY))
+                    .unwrap_or_default(),
+                if allow_legacy {
+                    home.join(".cache/pastvideo/models/Qwen3-VL-Embedding-2B-modelscope")
+                } else {
+                    PathBuf::new()
+                },
+            ])
+        });
+    let worker_script = env::var_os("PASTVIDEO_QWEN_WORKER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            first_file([
+                managed_runtime.join("qwen_worker.py"),
+                packaged
+                    .as_ref()
+                    .map(|root| root.join("runtime/qwen_worker.py"))
+                    .unwrap_or_default(),
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/qwen_worker.py"),
+            ])
+        });
+    QwenInstallStatus {
+        python,
+        model_path,
+        worker_script,
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn valid_model_dir(path: &Path) -> bool {
+    path.join(MODEL_WEIGHT_FILE).is_file()
+        && path.join("config.json").is_file()
+        && path.join("scripts/qwen3_vl_embedding.py").is_file()
+}
+
+fn first_file<const N: usize>(paths: [PathBuf; N]) -> Option<PathBuf> {
+    paths.into_iter().find(|path| path.is_file())
+}
+
+fn first_model_dir<const N: usize>(paths: [PathBuf; N]) -> Option<PathBuf> {
+    paths.into_iter().find(|path| valid_model_dir(path))
+}
 
 #[derive(Debug, Clone)]
 pub struct QwenConfig {
@@ -30,26 +168,26 @@ impl QwenConfig {
     /// `PASTVIDEO_QWEN_PYTHON`, `PASTVIDEO_QWEN_MODEL`, or
     /// `PASTVIDEO_QWEN_WORKER`.
     pub fn from_env() -> Result<Self> {
-        let home = home_dir();
-        let python = env::var_os("PASTVIDEO_QWEN_PYTHON")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    home.join(".venvs/qwen3-vl-cu128/Scripts/python.exe")
-                } else {
-                    home.join(".venvs/qwen3-vl/bin/python")
-                }
-            });
-        let model_path = env::var_os("PASTVIDEO_QWEN_MODEL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                home.join(".cache/pastvideo/models/Qwen3-VL-Embedding-2B-modelscope")
-            });
-        let worker_script = env::var_os("PASTVIDEO_QWEN_WORKER")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/qwen_worker.py")
-            });
+        Self::discover(None)
+    }
+
+    pub fn discover(model_override: Option<&Path>) -> Result<Self> {
+        let status = qwen_install_status(model_override);
+        let python = status.python.ok_or_else(|| {
+            Error::Embed(format!(
+                "Qwen Python runtime was not found. Install the PastVideo AI runtime in {}.",
+                managed_runtime_dir().display()
+            ))
+        })?;
+        let model_path = status.model_path.ok_or_else(|| {
+            Error::Embed(format!(
+                "Qwen model weights were not found. Install them in {}.",
+                managed_model_dir().display()
+            ))
+        })?;
+        let worker_script = status
+            .worker_script
+            .ok_or_else(|| Error::Embed("The packaged Qwen worker script was not found.".into()))?;
         let max_frames = env::var("PASTVIDEO_QWEN_MAX_FRAMES")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -64,19 +202,6 @@ impl QwenConfig {
             .and_then(|value| value.parse().ok())
             .unwrap_or(batch_size.saturating_mul(2))
             .clamp(batch_size, 24);
-
-        for (label, path) in [
-            ("Qwen Python runtime", &python),
-            ("Qwen model", &model_path),
-            ("Qwen worker", &worker_script),
-        ] {
-            if !path.exists() {
-                return Err(Error::Embed(format!(
-                    "{label} was not found at {}. Run scripts/setup_qwen.ps1 or set the corresponding PASTVIDEO_QWEN_* variable.",
-                    path.display()
-                )));
-            }
-        }
 
         Ok(Self {
             python,
@@ -97,7 +222,8 @@ struct Worker {
 
 impl Worker {
     fn start(config: &QwenConfig) -> Result<Self> {
-        let mut child = Command::new(&config.python)
+        let mut command = Command::new(&config.python);
+        command
             .arg(&config.worker_script)
             .arg("--model")
             .arg(&config.model_path)
@@ -107,14 +233,16 @@ impl Worker {
             .arg(config.batch_size.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| {
-                Error::Embed(format!(
-                    "failed to start Qwen worker with {}: {error}",
-                    config.python.display()
-                ))
-            })?;
+            .stderr(Stdio::inherit());
+        if let Ok(ffmpeg) = crate::chunker::find_ffmpeg() {
+            command.env("PASTVIDEO_FFMPEG", ffmpeg);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            Error::Embed(format!(
+                "failed to start Qwen worker with {}: {error}",
+                config.python.display()
+            ))
+        })?;
         let input = child
             .stdin
             .take()

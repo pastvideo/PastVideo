@@ -22,6 +22,11 @@ use crate::catalog::{
     semantic_categories_with_embeddings, semantic_category_for_source, Thumbnail, VideoInfo,
 };
 use crate::chunker::find_ffmpeg;
+use crate::distribution::{
+    self, DownloadProgress, MODEL_DOWNLOAD_URL, MODEL_PAGE_URL, RUNTIME_CORE_URL,
+    RUNTIME_CUDA_1_URL, RUNTIME_CUDA_2_URL,
+};
+use crate::i18n::{text, Language};
 use crate::provider::{create_embedder, EmbeddingProvider, EmbeddingSettings};
 use crate::{Config, Database, EnrichmentStore, IndexProgress, IndexReport, Match, SharedEmbedder};
 
@@ -70,6 +75,7 @@ struct Preferences {
     /// the initial directory for the next Add folder dialog.
     last_folder: Option<PathBuf>,
     embedding: EmbeddingSettings,
+    language: Language,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,12 +87,12 @@ enum TaskKind {
 }
 
 impl TaskKind {
-    fn label(self) -> &'static str {
+    fn label(self, language: Language) -> &'static str {
         match self {
-            Self::Scanning => "Scanning library",
-            Self::Indexing => "Indexing videos",
-            Self::ClearingIndex => "Clearing index",
-            Self::TestingProvider => "Testing connection",
+            Self::Scanning => text(language, "scanning"),
+            Self::Indexing => text(language, "indexing"),
+            Self::ClearingIndex => text(language, "clearing_index"),
+            Self::TestingProvider => text(language, "testing_connection"),
         }
     }
 }
@@ -117,11 +123,23 @@ enum WorkerMessage {
     SearchFinished(std::result::Result<Vec<Match>, String>),
     ProviderTestFinished(std::result::Result<String, String>),
     SegmentExportFinished(std::result::Result<PathBuf, String>),
+    AiInstallProgress(DownloadProgress),
+    AiInstallFinished(std::result::Result<AiInstallOutcome, String>),
 }
 
 struct IndexOutcome {
     report: IndexReport,
     categories: HashMap<String, String>,
+}
+
+struct AiInstallOutcome {
+    model_path: Option<PathBuf>,
+}
+
+enum ModelInstallSource {
+    None,
+    Download,
+    Local(PathBuf),
 }
 
 struct MatchPlayer {
@@ -144,14 +162,14 @@ enum PlaybackKind {
 }
 
 impl PlaybackKind {
-    fn window_title(self) -> &'static str {
-        "Video player"
+    fn window_title(self, language: Language) -> &'static str {
+        text(language, "video_player")
     }
 
-    fn eyebrow(self) -> &'static str {
+    fn eyebrow(self, language: Language) -> &'static str {
         match self {
-            Self::FullVideo => "FULL VIDEO",
-            Self::MatchedClip => "VIDEO · MATCHED START",
+            Self::FullVideo => text(language, "full_video"),
+            Self::MatchedClip => text(language, "matched_start"),
         }
     }
 }
@@ -201,6 +219,11 @@ pub struct PastVideoApp {
     notice: Option<(String, bool)>,
     settings_open: bool,
     clear_index_confirm: bool,
+    ai_setup_open: bool,
+    ai_installing: bool,
+    ai_install_progress: Option<DownloadProgress>,
+    ai_install_error: Option<String>,
+    resume_index_after_ai_setup: bool,
     player: Option<MatchPlayer>,
     player_open: bool,
     player_generation: u64,
@@ -259,6 +282,11 @@ impl PastVideoApp {
             notice: None,
             settings_open: false,
             clear_index_confirm: false,
+            ai_setup_open: false,
+            ai_installing: false,
+            ai_install_progress: None,
+            ai_install_error: None,
+            resume_index_after_ai_setup: false,
             player: None,
             player_open: false,
             player_generation: 0,
@@ -309,7 +337,8 @@ impl PastVideoApp {
     }
 
     fn add_folder(&mut self) {
-        let mut dialog = rfd::FileDialog::new().set_title("Add a video folder");
+        let mut dialog =
+            rfd::FileDialog::new().set_title(text(self.preferences.language, "add_video_folder"));
         if let Some(folder) = self.preferences.last_folder.as_ref() {
             dialog = dialog.set_directory(folder);
         }
@@ -321,7 +350,7 @@ impl PastVideoApp {
                 .any(|existing| paths_equal(existing, &folder))
             {
                 self.folders_expanded = true;
-                self.notice = Some(("That folder is already in your library.".into(), false));
+                self.notice = Some((folder_already_added(self.preferences.language), false));
                 return;
             }
             self.preferences.folders.push(folder.clone());
@@ -388,9 +417,10 @@ impl PastVideoApp {
         self.preferences.last_folder = self.preferences.folders.last().cloned();
         self.persist();
         self.notice = Some((
-            format!(
-                "Removed {} and {removed_videos} videos from this library. Source files and saved index data were not changed.",
-                folder_display_name(&removed)
+            folder_removed_message(
+                self.preferences.language,
+                folder_display_name(&removed),
+                removed_videos,
             ),
             false,
         ));
@@ -667,9 +697,61 @@ impl PastVideoApp {
         Ok(embedder)
     }
 
+    fn local_ai_status(&self) -> crate::embedder::qwen::QwenInstallStatus {
+        distribution::install_status(self.preferences.embedding.local_model_path.as_deref())
+    }
+
+    fn start_ai_install(&mut self, install_runtime: bool, model_source: ModelInstallSource) {
+        if self.ai_installing {
+            return;
+        }
+        self.ai_installing = true;
+        self.ai_install_progress = None;
+        self.ai_install_error = None;
+        let tx = self.tx.clone();
+        let repaint = self.repaint.clone();
+        thread::spawn(move || {
+            let result = (|| -> std::result::Result<AiInstallOutcome, String> {
+                let mut report = |progress| {
+                    let _ = tx.send(WorkerMessage::AiInstallProgress(progress));
+                    repaint.request_repaint();
+                };
+                if install_runtime {
+                    distribution::download_and_install_runtime(&mut report)
+                        .map_err(|error| error.to_string())?;
+                }
+                let model_path = match model_source {
+                    ModelInstallSource::None => None,
+                    ModelInstallSource::Download => Some(
+                        distribution::download_and_install_model(&mut report)
+                            .map_err(|error| error.to_string())?,
+                    ),
+                    ModelInstallSource::Local(path) => Some(
+                        distribution::install_downloaded_model(&path, &mut report)
+                            .map_err(|error| error.to_string())?,
+                    ),
+                };
+                Ok(AiInstallOutcome { model_path })
+            })();
+            let _ = tx.send(WorkerMessage::AiInstallFinished(result));
+            repaint.request_repaint();
+        });
+    }
+
     fn start_index(&mut self) {
+        if self.task.is_some() || self.ai_installing {
+            return;
+        }
         if self.preferences.folders.is_empty() {
-            self.notice = Some(("Add a folder first.".into(), true));
+            self.notice = Some((add_folder_first(self.preferences.language), true));
+            return;
+        }
+        if self.preferences.embedding.provider == EmbeddingProvider::LocalGpu
+            && !self.local_ai_status().ready()
+        {
+            self.ai_setup_open = true;
+            self.ai_install_error = None;
+            self.resume_index_after_ai_setup = true;
             return;
         }
         let folders = self.preferences.folders.clone();
@@ -997,15 +1079,10 @@ impl PastVideoApp {
                     }
                     self.task = None;
                     self.notice = Some((
-                        format!(
-                            "Found {} videos across {} {}. Ready to index.",
+                        scan_ready_message(
+                            self.preferences.language,
                             self.videos.len(),
                             self.preferences.folders.len(),
-                            if self.preferences.folders.len() == 1 {
-                                "folder"
-                            } else {
-                                "folders"
-                            }
                         ),
                         false,
                     ));
@@ -1109,21 +1186,13 @@ impl PastVideoApp {
                     match result {
                         Ok(outcome) => {
                             apply_categories(&mut self.videos, &outcome.categories);
-                            let message = if outcome.report.cancelled {
-                                format!(
-                                    "Indexing stopped. Kept {} new moments from {} videos · {} total moments",
-                                    outcome.report.new_chunks,
-                                    outcome.report.files_indexed,
-                                    outcome.report.total_chunks
-                                )
-                            } else {
-                                format!(
-                                    "Indexed {} new moments from {} videos · {} total moments",
-                                    outcome.report.new_chunks,
-                                    outcome.report.files_indexed,
-                                    outcome.report.total_chunks
-                                )
-                            };
+                            let message = index_finished_message(
+                                self.preferences.language,
+                                outcome.report.cancelled,
+                                outcome.report.new_chunks,
+                                outcome.report.files_indexed,
+                                outcome.report.total_chunks,
+                            );
                             self.notice = Some((message, false));
                         }
                         Err(error) => self.notice = Some((friendly_error(&error), true)),
@@ -1144,8 +1213,10 @@ impl PastVideoApp {
                                 video.category = infer_category(&video.path).to_owned();
                             }
                             self.notice = Some((
-                                format!(
-                                    "Cleared {moments} visual moments and {enrichment_records} understanding records. Source videos were not changed."
+                                index_cleared_message(
+                                    self.preferences.language,
+                                    moments,
+                                    enrichment_records,
                                 ),
                                 false,
                             ));
@@ -1185,11 +1256,39 @@ impl PastVideoApp {
                                 .file_name()
                                 .and_then(|value| value.to_str())
                                 .unwrap_or("matched segment");
-                            self.notice =
-                                Some((format!("Saved matched segment as {name}."), false));
+                            self.notice = Some((
+                                segment_saved_message(self.preferences.language, name),
+                                false,
+                            ));
                         }
                         Err(error) => {
                             self.notice = Some((format!("Could not save segment: {error}"), true));
+                        }
+                    }
+                }
+                WorkerMessage::AiInstallProgress(progress) => {
+                    self.ai_install_progress = Some(progress);
+                }
+                WorkerMessage::AiInstallFinished(result) => {
+                    self.ai_installing = false;
+                    match result {
+                        Ok(outcome) => {
+                            if let Some(model_path) = outcome.model_path {
+                                self.preferences.embedding.local_model_path =
+                                    Some(model_path.clone());
+                                self.settings_draft.local_model_path = Some(model_path);
+                            }
+                            self.shared_embedder = None;
+                            self.ai_install_progress = None;
+                            self.ai_install_error = None;
+                            self.persist();
+                            self.notice = Some((
+                                text(self.preferences.language, "install_complete").into(),
+                                false,
+                            ));
+                        }
+                        Err(error) => {
+                            self.ai_install_error = Some(error);
                         }
                     }
                 }
@@ -1206,10 +1305,7 @@ impl PastVideoApp {
         self.search_results.clear();
         self.searched_query = None;
         self.settings_open = false;
-        self.notice = Some((
-            "Embedding provider saved. Providers keep separate indexes.".into(),
-            false,
-        ));
+        self.notice = Some((settings_saved_message(self.preferences.language), false));
         let categories = load_categories(&self.categories_path(&self.preferences.embedding));
         apply_categories(&mut self.videos, &categories);
     }
@@ -1282,6 +1378,7 @@ impl PastVideoApp {
     }
 
     fn show_sidebar(&mut self, root: &mut egui::Ui) {
+        let language = self.preferences.language;
         egui::Panel::left("navigation")
             .exact_size(230.0)
             .resizable(false)
@@ -1294,17 +1391,17 @@ impl PastVideoApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("LIBRARY")
+                        RichText::new(text(language, "library"))
                             .monospace()
                             .size(9.0)
                             .color(SIGNAL),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button("Settings")
-                            .on_hover_text(format!(
-                                "Embedding provider: {}",
-                                self.preferences.embedding.provider.short_label()
+                            .small_button(text(language, "settings"))
+                            .on_hover_text(provider_hover_text(
+                                language,
+                                provider_label(language, self.preferences.embedding.provider),
                             ))
                             .clicked()
                         {
@@ -1315,17 +1412,18 @@ impl PastVideoApp {
                 });
                 ui.add_space(8.0);
                 let folder_toggle = if self.folders_expanded {
-                    "Hide folders"
+                    text(language, "hide_folders")
                 } else {
-                    "Show folders"
+                    text(language, "show_folders")
                 };
                 if ui
                     .add_sized(
                         [198.0, 38.0],
                         egui::Button::new(
                             RichText::new(format!(
-                                "{folder_toggle}  ·  {} videos",
-                                self.videos.len()
+                                "{folder_toggle}  ·  {} {}",
+                                self.videos.len(),
+                                text(language, "videos").to_ascii_lowercase()
                             ))
                             .strong()
                             .color(CREAM),
@@ -1346,7 +1444,7 @@ impl PastVideoApp {
                             .inner_margin(egui::Margin::same(10))
                             .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new("No folders yet")
+                                    RichText::new(text(language, "no_folders"))
                                         .size(11.0)
                                         .color(MUTED),
                                 );
@@ -1388,7 +1486,9 @@ impl PastVideoApp {
                                                                 self.task.is_none()
                                                                     && !self.searching,
                                                                 egui::Button::new(
-                                                                    RichText::new("Remove")
+                                                                    RichText::new(text(
+                                                                        language, "remove",
+                                                                    ))
                                                                         .size(9.0)
                                                                         .color(DANGER),
                                                                 )
@@ -1438,7 +1538,9 @@ impl PastVideoApp {
                     .add_enabled(
                         self.task.is_none() && !self.searching,
                         egui::Button::new(
-                            RichText::new("+  Add folder").strong().color(INK),
+                            RichText::new(text(language, "add_folder"))
+                                .strong()
+                                .color(INK),
                         )
                         .fill(SIGNAL)
                         .min_size(Vec2::new(198.0, 36.0)),
@@ -1451,11 +1553,16 @@ impl PastVideoApp {
                     self.remove_folder(index);
                 }
                 ui.add_space(22.0);
-                ui.label(RichText::new("EXPLORE").monospace().size(9.0).color(MUTED));
+                ui.label(
+                    RichText::new(text(language, "explore"))
+                        .monospace()
+                        .size(9.0)
+                        .color(MUTED),
+                );
                 ui.add_space(8.0);
                 if sidebar_item(
                     ui,
-                    "All videos",
+                    text(language, "all_videos"),
                     self.videos.len(),
                     self.category_filter.is_none(),
                 ) {
@@ -1467,7 +1574,7 @@ impl PastVideoApp {
                 }
                 for (category, count) in self.category_counts() {
                     let selected = self.category_filter.as_deref() == Some(category.as_str());
-                    if sidebar_item(ui, &category, count, selected) {
+                    if sidebar_item(ui, category_label(language, &category), count, selected) {
                         self.close_player();
                         self.selected_match = None;
                         self.category_filter = Some(category);
@@ -1481,7 +1588,7 @@ impl PastVideoApp {
                         ui.add_space(8.0);
                     }
                     ui.label(
-                        RichText::new("Local metadata and indexes stay on this device.")
+                        RichText::new(text(language, "local_only"))
                             .size(10.0)
                             .color(MUTED),
                     );
@@ -1490,6 +1597,7 @@ impl PastVideoApp {
     }
 
     fn show_details(&mut self, root: &mut egui::Ui) {
+        let language = self.preferences.language;
         egui::Panel::right("details")
             .exact_size(310.0)
             .resizable(false)
@@ -1499,7 +1607,12 @@ impl PastVideoApp {
                     .inner_margin(egui::Margin::same(18)),
             )
             .show(root, |ui| {
-                ui.label(RichText::new("DETAILS").monospace().size(9.0).color(SIGNAL));
+                ui.label(
+                    RichText::new(text(language, "details"))
+                        .monospace()
+                        .size(9.0)
+                        .color(SIGNAL),
+                );
                 ui.add_space(18.0);
                 if let Some(selected_match) = self.selected_match.clone() {
                     self.show_match_details(ui, &selected_match);
@@ -1508,10 +1621,19 @@ impl PastVideoApp {
                 } else {
                     ui.add_space(80.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("VIDEO").monospace().size(13.0).color(SIGNAL));
-                        ui.label(RichText::new("Select a video").size(17.0).color(CREAM));
                         ui.label(
-                            RichText::new("Details and actions appear here.")
+                            RichText::new(text(language, "video"))
+                                .monospace()
+                                .size(13.0)
+                                .color(SIGNAL),
+                        );
+                        ui.label(
+                            RichText::new(text(language, "select_video"))
+                                .size(17.0)
+                                .color(CREAM),
+                        );
+                        ui.label(
+                            RichText::new(text(language, "details_here"))
                                 .size(11.0)
                                 .color(MUTED),
                         );
@@ -1521,6 +1643,7 @@ impl PastVideoApp {
     }
 
     fn show_video_details(&mut self, ui: &mut egui::Ui, path: &Path) {
+        let language = self.preferences.language;
         let Some(video) = self
             .videos
             .iter()
@@ -1542,7 +1665,7 @@ impl PastVideoApp {
         }
         ui.add_space(15.0);
         ui.label(
-            RichText::new(&video.category)
+            RichText::new(category_label(language, &video.category))
                 .monospace()
                 .size(9.0)
                 .color(SIGNAL),
@@ -1569,7 +1692,7 @@ impl PastVideoApp {
         if ui
             .add_sized(
                 [274.0, 36.0],
-                egui::Button::new("Open in system player").fill(PANEL_RAISED),
+                egui::Button::new(text(language, "open_player")).fill(PANEL_RAISED),
             )
             .clicked()
         {
@@ -1580,7 +1703,7 @@ impl PastVideoApp {
         if ui
             .add_sized(
                 [274.0, 36.0],
-                egui::Button::new("Open containing folder").fill(PANEL_RAISED),
+                egui::Button::new(text(language, "open_folder")).fill(PANEL_RAISED),
             )
             .clicked()
         {
@@ -1592,7 +1715,7 @@ impl PastVideoApp {
         ui.separator();
         ui.add_space(12.0);
         ui.label(
-            RichText::new("FILE LOCATION")
+            RichText::new(text(language, "file_location"))
                 .monospace()
                 .size(8.0)
                 .color(MUTED),
@@ -1605,6 +1728,7 @@ impl PastVideoApp {
     }
 
     fn show_match_details(&mut self, ui: &mut egui::Ui, selected_match: &Match) {
+        let language = self.preferences.language;
         let path = Path::new(&selected_match.source_file);
         self.request_match_thumbnail(selected_match);
         if let Some(texture) = self.player_texture_for(selected_match, PlaybackKind::MatchedClip) {
@@ -1618,7 +1742,7 @@ impl PastVideoApp {
         }
         ui.add_space(15.0);
         ui.label(
-            RichText::new("MATCHED MOMENT")
+            RichText::new(text(language, "matched_moment"))
                 .monospace()
                 .size(9.0)
                 .color(SIGNAL),
@@ -1647,9 +1771,9 @@ impl PastVideoApp {
         ui.add_space(20.0);
         self.show_playback_controls(ui, selected_match, PlaybackKind::MatchedClip);
         let export_label = if self.segment_exporting {
-            "Saving matched segment..."
+            text(language, "saving_segment")
         } else {
-            "Save matched segment"
+            text(language, "save_segment")
         };
         if ui
             .add_enabled(
@@ -1666,7 +1790,7 @@ impl PastVideoApp {
         if ui
             .add_sized(
                 [274.0, 36.0],
-                egui::Button::new("Open full video").fill(PANEL_RAISED),
+                egui::Button::new(text(language, "open_full_video")).fill(PANEL_RAISED),
             )
             .clicked()
         {
@@ -1675,7 +1799,7 @@ impl PastVideoApp {
         if ui
             .add_sized(
                 [274.0, 36.0],
-                egui::Button::new("Open containing folder").fill(PANEL_RAISED),
+                egui::Button::new(text(language, "open_folder")).fill(PANEL_RAISED),
             )
             .clicked()
         {
@@ -1686,6 +1810,7 @@ impl PastVideoApp {
     }
 
     fn show_playback_controls(&mut self, ui: &mut egui::Ui, playback: &Match, kind: PlaybackKind) {
+        let language = self.preferences.language;
         let playing = self.player.as_ref().is_some_and(|player| {
             player.kind == kind && same_match(&player.hit, playback) && player.playing
         });
@@ -1694,9 +1819,13 @@ impl PastVideoApp {
                 .add_sized(
                     [116.0, 42.0],
                     egui::Button::new(
-                        RichText::new(if playing { "Ⅱ  Pause" } else { "▶  Play" })
-                            .strong()
-                            .color(INK),
+                        RichText::new(if playing {
+                            text(language, "pause")
+                        } else {
+                            text(language, "play")
+                        })
+                        .strong()
+                        .color(INK),
                     )
                     .fill(SIGNAL),
                 )
@@ -1707,7 +1836,7 @@ impl PastVideoApp {
             if ui
                 .add_sized(
                     [66.0, 42.0],
-                    egui::Button::new("■  Stop").fill(PANEL_RAISED),
+                    egui::Button::new(text(language, "stop")).fill(PANEL_RAISED),
                 )
                 .clicked()
             {
@@ -1716,9 +1845,9 @@ impl PastVideoApp {
             if ui
                 .add_sized(
                     [76.0, 42.0],
-                    egui::Button::new("↗  Enlarge").fill(PANEL_RAISED),
+                    egui::Button::new(text(language, "enlarge")).fill(PANEL_RAISED),
                 )
-                .on_hover_text(kind.window_title())
+                .on_hover_text(kind.window_title(language))
                 .clicked()
             {
                 self.open_player(playback, kind);
@@ -1734,6 +1863,7 @@ impl PastVideoApp {
             self.player_open = false;
             return;
         };
+        let language = self.preferences.language;
         let hit = player.hit.clone();
         let kind = player.kind;
         let range_start = player.range_start;
@@ -1751,7 +1881,7 @@ impl PastVideoApp {
             .to_owned();
         let mut open = self.player_open;
         let mut actions = Vec::new();
-        egui::Window::new(kind.window_title())
+        egui::Window::new(kind.window_title(language))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -1767,7 +1897,7 @@ impl PastVideoApp {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new(kind.eyebrow())
+                            RichText::new(kind.eyebrow(language))
                                 .monospace()
                                 .size(9.0)
                                 .color(SIGNAL),
@@ -1847,13 +1977,16 @@ impl PastVideoApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_sized([92.0, 38.0], egui::Button::new("+10s  →"))
+                            .add_sized(
+                                [92.0, 38.0],
+                                egui::Button::new(text(language, "forward_10")),
+                            )
                             .clicked()
                         {
                             actions.push(PlayerUiAction::SeekBy(10.0));
                         }
                         if ui
-                            .add_sized([76.0, 38.0], egui::Button::new("■  Stop"))
+                            .add_sized([76.0, 38.0], egui::Button::new(text(language, "stop")))
                             .clicked()
                         {
                             actions.push(PlayerUiAction::Stop);
@@ -1862,9 +1995,13 @@ impl PastVideoApp {
                             .add_sized(
                                 [112.0, 38.0],
                                 egui::Button::new(
-                                    RichText::new(if playing { "Ⅱ  Pause" } else { "▶  Play" })
-                                        .strong()
-                                        .color(INK),
+                                    RichText::new(if playing {
+                                        text(language, "pause")
+                                    } else {
+                                        text(language, "play")
+                                    })
+                                    .strong()
+                                    .color(INK),
                                 )
                                 .fill(SIGNAL),
                             )
@@ -1873,7 +2010,7 @@ impl PastVideoApp {
                             actions.push(PlayerUiAction::Toggle);
                         }
                         if ui
-                            .add_sized([92.0, 38.0], egui::Button::new("←  −10s"))
+                            .add_sized([92.0, 38.0], egui::Button::new(text(language, "back_10")))
                             .clicked()
                         {
                             actions.push(PlayerUiAction::SeekBy(-10.0));
@@ -1888,6 +2025,7 @@ impl PastVideoApp {
     }
 
     fn show_search(&mut self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
         egui::Frame::new()
             .fill(CREAM)
             .corner_radius(8)
@@ -1895,7 +2033,7 @@ impl PastVideoApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("FIND")
+                        RichText::new(text(language, "find"))
                             .monospace()
                             .size(9.0)
                             .strong()
@@ -1905,7 +2043,7 @@ impl PastVideoApp {
                         [ui.available_width() - 145.0, 38.0],
                         egui::TextEdit::singleline(&mut self.search_query)
                             .hint_text(
-                                RichText::new("Describe a moment — “dog running on the beach”")
+                                RichText::new(text(language, "search_hint"))
                                     .size(17.0)
                                     .color(Color32::from_rgb(112, 114, 108)),
                             )
@@ -1917,7 +2055,7 @@ impl PastVideoApp {
                         ui.painter().text(
                             input.rect.left_center() + Vec2::new(4.0, 0.0),
                             egui::Align2::LEFT_CENTER,
-                            "Describe a moment — “dog running on the beach”",
+                            text(language, "search_hint"),
                             egui::FontId::proportional(17.0),
                             Color32::from_rgb(112, 114, 108),
                         );
@@ -1929,7 +2067,10 @@ impl PastVideoApp {
                         .add_enabled(
                             enabled,
                             egui::Button::new(
-                                RichText::new("SEARCH  →").monospace().strong().color(CREAM),
+                                RichText::new(text(language, "search"))
+                                    .monospace()
+                                    .strong()
+                                    .color(CREAM),
                             )
                             .fill(INK)
                             .min_size(Vec2::new(126.0, 42.0)),
@@ -1944,6 +2085,7 @@ impl PastVideoApp {
     }
 
     fn show_index_progress(&self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
         let stopping = self
             .index_cancel
             .as_ref()
@@ -1953,9 +2095,9 @@ impl PastVideoApp {
                 ui.spinner();
                 ui.label(
                     RichText::new(if stopping {
-                        "Stopping indexing…"
+                        text(language, "stopping")
                     } else {
-                        "Preparing local index…"
+                        text(language, "preparing_index")
                     })
                     .size(11.0)
                     .color(SIGNAL),
@@ -1977,12 +2119,18 @@ impl PastVideoApp {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
-                    "{}  ·  {}/{} VIDEOS  ·  {}/{} MOMENTS",
-                    if stopping { "STOPPING" } else { "INDEXING" },
+                    "{}  ·  {}/{} {}  ·  {}/{} {}",
+                    if stopping {
+                        text(language, "stopping_index")
+                    } else {
+                        text(language, "indexing")
+                    },
                     progress.files_completed,
                     progress.files_total,
+                    text(language, "videos"),
                     progress.chunks_completed,
-                    progress.chunks_total
+                    progress.chunks_total,
+                    text(language, "moments")
                 ))
                 .monospace()
                 .size(10.0)
@@ -1991,7 +2139,7 @@ impl PastVideoApp {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(format!("{} new", progress.new_chunks))
+                    RichText::new(format!("{} {}", progress.new_chunks, text(language, "new")))
                         .size(10.0)
                         .color(MUTED),
                 );
@@ -2005,20 +2153,26 @@ impl PastVideoApp {
     }
 
     fn show_library(&mut self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
         let indices = self.filtered_video_indices();
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("VIDEO LIBRARY")
+                    RichText::new(text(language, "video_library"))
                         .monospace()
                         .size(9.0)
                         .color(SIGNAL),
                 );
                 ui.label(
-                    RichText::new(self.category_filter.as_deref().unwrap_or("All videos"))
-                        .size(25.0)
-                        .strong()
-                        .color(CREAM),
+                    RichText::new(
+                        self.category_filter
+                            .as_deref()
+                            .map(|category| category_label(language, category))
+                            .unwrap_or_else(|| text(language, "all_videos")),
+                    )
+                    .size(25.0)
+                    .strong()
+                    .color(CREAM),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2028,13 +2182,13 @@ impl PastVideoApp {
                     .as_ref()
                     .is_some_and(|cancel| cancel.load(Ordering::Acquire));
                 let label = if stopping {
-                    "Stopping…"
+                    text(language, "stopping")
                 } else if indexing {
-                    "■ Stop indexing"
+                    text(language, "stop_index")
                 } else if self.videos.is_empty() {
-                    "Index folders"
+                    text(language, "index_folders")
                 } else {
-                    "Index new videos"
+                    text(language, "index_new")
                 };
                 if ui
                     .add_enabled(
@@ -2063,7 +2217,7 @@ impl PastVideoApp {
                     }
                 }
                 ui.label(
-                    RichText::new(format!("{} VIDEOS", indices.len()))
+                    RichText::new(format!("{} {}", indices.len(), text(language, "videos")))
                         .monospace()
                         .size(9.0)
                         .color(MUTED),
@@ -2077,14 +2231,14 @@ impl PastVideoApp {
             return;
         }
         if self.task == Some(TaskKind::Scanning) && self.videos.is_empty() {
-            loading_panel(ui, "Looking through your folders…");
+            loading_panel(ui, text(language, "scanning"));
             return;
         }
         if indices.is_empty() {
             empty_panel(
                 ui,
-                "No videos here",
-                "Choose another category or add a folder containing supported video files.",
+                text(language, "no_videos"),
+                text(language, "no_videos_detail"),
             );
             return;
         }
@@ -2118,6 +2272,7 @@ impl PastVideoApp {
     }
 
     fn video_card(&mut self, ui: &mut egui::Ui, video: &VideoInfo, width: f32) {
+        let language = self.preferences.language;
         self.request_thumbnail(&video.path);
         let selected = self.selected_video.as_ref() == Some(&video.path);
         let frame = egui::Frame::new()
@@ -2148,7 +2303,7 @@ impl PastVideoApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(&video.category)
+                            RichText::new(category_label(language, &video.category))
                                 .monospace()
                                 .size(8.0)
                                 .color(SIGNAL),
@@ -2183,49 +2338,52 @@ impl PastVideoApp {
     }
 
     fn show_search_results(&mut self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("SEMANTIC SEARCH")
+                    RichText::new(text(language, "semantic_search"))
                         .monospace()
                         .size(9.0)
                         .color(SIGNAL),
                 );
                 ui.label(
-                    RichText::new(
-                        self.searched_query
-                            .as_deref()
-                            .map(|query| format!("Results for “{query}”"))
-                            .unwrap_or_else(|| "Results".into()),
-                    )
+                    RichText::new(search_results_title(
+                        language,
+                        self.searched_query.as_deref(),
+                    ))
                     .size(25.0)
                     .strong()
                     .color(CREAM),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Clear results").clicked() {
+                if ui.button(text(language, "clear_results")).clicked() {
                     self.close_player();
                     self.searched_query = None;
                     self.search_results.clear();
                     self.selected_match = None;
                 }
                 ui.label(
-                    RichText::new(format!("{} MOMENTS", self.search_results.len()))
-                        .monospace()
-                        .size(9.0)
-                        .color(MUTED),
+                    RichText::new(format!(
+                        "{} {}",
+                        self.search_results.len(),
+                        text(language, "moments")
+                    ))
+                    .monospace()
+                    .size(9.0)
+                    .color(MUTED),
                 );
             });
         });
         ui.add_space(16.0);
         if self.searching {
-            loading_panel(ui, "Searching every indexed moment…");
+            loading_panel(ui, text(language, "searching"));
         } else if self.search_results.is_empty() {
             empty_panel(
                 ui,
-                "No matching moments",
-                "Try a broader description or index your library first.",
+                text(language, "no_matches"),
+                text(language, "no_matches_detail"),
             );
         } else {
             let row_height = 126.0;
@@ -2332,6 +2490,7 @@ impl PastVideoApp {
     }
 
     fn show_onboarding(&mut self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
         egui::Frame::new()
             .fill(PANEL)
             .stroke(Stroke::new(1.0, LINE))
@@ -2348,15 +2507,26 @@ impl PastVideoApp {
                             .color(SIGNAL),
                     );
                     ui.add_space(12.0);
-                    ui.label(RichText::new("Bring your videos back into view").size(24.0).strong().color(CREAM));
+                    ui.label(
+                        RichText::new(text(language, "onboarding_title"))
+                            .size(24.0)
+                            .strong()
+                            .color(CREAM),
+                    );
                     ui.add_space(7.0);
-                    ui.label(RichText::new("Add one or more folders. PastVideo combines their videos into one searchable library.").size(12.0).color(MUTED));
+                    ui.label(
+                        RichText::new(text(language, "onboarding_detail"))
+                            .size(12.0)
+                            .color(MUTED),
+                    );
                     ui.add_space(22.0);
                     if ui
                         .add_sized(
                             [190.0, 42.0],
                             egui::Button::new(
-                                RichText::new("Add a folder").strong().color(INK),
+                                RichText::new(text(language, "add_a_folder"))
+                                    .strong()
+                                    .color(INK),
                             )
                             .fill(SIGNAL),
                         )
@@ -2372,8 +2542,9 @@ impl PastVideoApp {
         if !self.settings_open {
             return;
         }
+        let language = self.preferences.language;
         let mut open = self.settings_open;
-        egui::Window::new("Embedding settings")
+        egui::Window::new(text(language, "embedding_settings"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -2385,56 +2556,150 @@ impl PastVideoApp {
                     .inner_margin(egui::Margin::same(22)),
             )
             .show(ctx, |ui| {
-                ui.label(RichText::new("Choose how PastVideo understands your footage.").size(12.0).color(MUTED));
+                ui.label(
+                    RichText::new(text(language, "settings_intro"))
+                        .size(12.0)
+                        .color(MUTED),
+                );
                 ui.add_space(16.0);
-                ui.label(RichText::new("PROVIDER").monospace().size(9.0).color(MUTED));
+                ui.label(
+                    RichText::new(text(language, "language"))
+                        .monospace()
+                        .size(9.0)
+                        .color(MUTED),
+                );
+                let previous_language = self.preferences.language;
+                egui::ComboBox::from_id_salt("desktop_language")
+                    .selected_text(self.preferences.language.native_name())
+                    .width(430.0)
+                    .show_ui(ui, |ui| {
+                        for candidate in Language::ALL {
+                            ui.selectable_value(
+                                &mut self.preferences.language,
+                                candidate,
+                                candidate.native_name(),
+                            );
+                        }
+                    });
+                if self.preferences.language != previous_language {
+                    // Notices are rendered eagerly in the language that was
+                    // active when they were created. Drop an old notice when
+                    // switching languages so the interface never mixes locales.
+                    self.notice = None;
+                    self.persist();
+                    ctx.request_repaint();
+                }
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new(text(language, "provider"))
+                        .monospace()
+                        .size(9.0)
+                        .color(MUTED),
+                );
                 egui::ComboBox::from_id_salt("embedding_provider")
-                    .selected_text(self.settings_draft.provider.label())
+                    .selected_text(provider_label(language, self.settings_draft.provider))
                     .width(430.0)
                     .show_ui(ui, |ui| {
                         for provider in EmbeddingProvider::ALL {
                             ui.selectable_value(
                                 &mut self.settings_draft.provider,
                                 provider,
-                                provider.label(),
+                                provider_label(language, provider),
                             );
                         }
                     });
                 ui.add_space(14.0);
                 match self.settings_draft.provider {
                     EmbeddingProvider::Gemini => {
-                        setting_text(ui, "MODEL", &mut self.settings_draft.gemini_model, false);
-                        setting_text(ui, "API KEY · HELD IN MEMORY ONLY", &mut self.settings_draft.gemini_api_key, true);
-                        setting_dimension(ui, &mut self.settings_draft.gemini_dimensions, 128..=3072);
-                        ui.label(RichText::new("Gemini is the default and supports text, images, and video in one embedding space.").size(10.0).color(MUTED));
+                        setting_text(
+                            ui,
+                            text(language, "model"),
+                            &mut self.settings_draft.gemini_model,
+                            false,
+                        );
+                        setting_text(
+                            ui,
+                            text(language, "api_key"),
+                            &mut self.settings_draft.gemini_api_key,
+                            true,
+                        );
+                        setting_dimension(
+                            ui,
+                            text(language, "dimensions"),
+                            &mut self.settings_draft.gemini_dimensions,
+                            128..=3072,
+                        );
+                        ui.label(
+                            RichText::new(text(language, "gemini_help"))
+                                .size(10.0)
+                                .color(MUTED),
+                        );
                     }
                     EmbeddingProvider::Remote => {
-                        setting_text(ui, "ENDPOINT", &mut self.settings_draft.remote_endpoint, false);
-                        setting_text(ui, "MODEL", &mut self.settings_draft.remote_model, false);
-                        setting_text(ui, "BEARER TOKEN · OPTIONAL", &mut self.settings_draft.remote_api_key, true);
-                        setting_dimension(ui, &mut self.settings_draft.remote_dimensions, 1..=8192);
-                        ui.label(RichText::new("POST JSON contract: kind, model, dimensions, and text or base64 media.").size(10.0).color(MUTED));
+                        setting_text(
+                            ui,
+                            text(language, "endpoint"),
+                            &mut self.settings_draft.remote_endpoint,
+                            false,
+                        );
+                        setting_text(
+                            ui,
+                            text(language, "model"),
+                            &mut self.settings_draft.remote_model,
+                            false,
+                        );
+                        setting_text(
+                            ui,
+                            text(language, "bearer"),
+                            &mut self.settings_draft.remote_api_key,
+                            true,
+                        );
+                        setting_dimension(
+                            ui,
+                            text(language, "dimensions"),
+                            &mut self.settings_draft.remote_dimensions,
+                            1..=8192,
+                        );
+                        ui.label(
+                            RichText::new(text(language, "remote_help"))
+                                .size(10.0)
+                                .color(MUTED),
+                        );
                     }
                     EmbeddingProvider::LocalGpu => {
-                        ui.label(RichText::new("Uses the existing Qwen3-VL worker and your local CUDA GPU. Configure paths with PASTVIDEO_QWEN_* environment variables.").size(11.0).color(MUTED));
+                        ui.label(
+                            RichText::new(text(language, "gpu_help"))
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        if ui.button(text(language, "manage_ai")).clicked() {
+                            self.ai_setup_open = true;
+                            self.resume_index_after_ai_setup = false;
+                            self.settings_open = false;
+                        }
                     }
                     EmbeddingProvider::LocalCpu => {
-                        ui.label(RichText::new("Private and dependency-light. Best for offline testing; semantic quality is intentionally basic.").size(11.0).color(MUTED));
+                        ui.label(
+                            RichText::new(text(language, "cpu_help"))
+                                .size(11.0)
+                                .color(MUTED),
+                        );
                     }
                 }
                 ui.add_space(20.0);
                 ui.separator();
                 ui.add_space(12.0);
                 ui.label(
-                    RichText::new("INDEX MANAGEMENT")
+                    RichText::new(text(language, "index_management"))
                         .monospace()
                         .size(9.0)
                         .color(MUTED),
                 );
                 ui.label(
-                    RichText::new(format!(
-                        "Clear the {} index to rebuild it from scratch. Your video files stay untouched.",
-                        self.preferences.embedding.provider.short_label()
+                    RichText::new(clear_index_help(
+                        language,
+                        provider_label(language, self.preferences.embedding.provider),
                     ))
                     .size(10.0)
                     .color(MUTED),
@@ -2444,7 +2709,9 @@ impl PastVideoApp {
                     .add_enabled(
                         self.task.is_none() && !self.searching,
                         egui::Button::new(
-                            RichText::new("Clear current index").strong().color(CREAM),
+                            RichText::new(text(language, "clear_current_index"))
+                                .strong()
+                                .color(CREAM),
                         )
                         .fill(Color32::from_rgb(91, 43, 34)),
                     )
@@ -2460,7 +2727,7 @@ impl PastVideoApp {
                     if ui
                         .add_enabled(
                             self.task.is_none() && !self.searching,
-                            egui::Button::new("Test connection").fill(PANEL),
+                            egui::Button::new(text(language, "test_connection")).fill(PANEL),
                         )
                         .clicked()
                     {
@@ -2471,7 +2738,9 @@ impl PastVideoApp {
                             .add_enabled(
                                 self.task.is_none() && !self.searching,
                                 egui::Button::new(
-                                    RichText::new("Save settings").strong().color(INK),
+                                    RichText::new(text(language, "save_settings"))
+                                        .strong()
+                                        .color(INK),
                                 )
                                 .fill(SIGNAL),
                             )
@@ -2485,12 +2754,224 @@ impl PastVideoApp {
         self.settings_open = open && self.settings_open;
     }
 
+    fn show_ai_setup(&mut self, ctx: &egui::Context) {
+        if !self.ai_setup_open {
+            return;
+        }
+        let language = self.preferences.language;
+        let status = self.local_ai_status();
+        let runtime_ready = status.runtime_ready();
+        let model_ready = status.model_ready();
+        let ready = status.ready();
+        let mut open = self.ai_setup_open;
+        let mut download_runtime = false;
+        let mut download_model = false;
+        let mut download_all = false;
+        let mut choose_model = false;
+        let mut continue_index = false;
+        let mut close_requested = false;
+
+        egui::Window::new(text(language, "ai_setup_title"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(590.0)
+            .frame(
+                egui::Frame::window(&ctx.style_of(egui::Theme::Dark))
+                    .fill(PANEL_RAISED)
+                    .inner_margin(egui::Margin::same(24)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(text(language, "ai_setup_intro"))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                ui.add_space(18.0);
+                ai_status_row(
+                    ui,
+                    text(language, "runtime"),
+                    if runtime_ready {
+                        text(language, "runtime_ready")
+                    } else {
+                        text(language, "runtime_missing")
+                    },
+                    runtime_ready,
+                );
+                ai_status_row(
+                    ui,
+                    text(language, "model_name"),
+                    if model_ready {
+                        text(language, "model_ready")
+                    } else {
+                        text(language, "model_missing")
+                    },
+                    model_ready,
+                );
+
+                if let Some(progress) = self.ai_install_progress.as_ref() {
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(localized_download_stage(language, &progress.stage))
+                            .size(11.0)
+                            .strong()
+                            .color(SIGNAL),
+                    );
+                    let fraction = progress
+                        .total
+                        .filter(|total| *total > 0)
+                        .map(|total| progress.completed as f32 / total as f32)
+                        .unwrap_or(0.0);
+                    ui.add(
+                        egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                            .desired_width(ui.available_width())
+                            .text(format_download_progress(progress.completed, progress.total)),
+                    );
+                }
+                if let Some(error) = self.ai_install_error.as_deref() {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(error).size(11.0).color(DANGER));
+                }
+
+                ui.add_space(18.0);
+                ui.horizontal_wrapped(|ui| {
+                    if !runtime_ready
+                        && ui
+                            .add_enabled(
+                                !self.ai_installing,
+                                egui::Button::new(text(language, "download_runtime")).fill(PANEL),
+                            )
+                            .clicked()
+                    {
+                        download_runtime = true;
+                    }
+                    if !model_ready
+                        && ui
+                            .add_enabled(
+                                !self.ai_installing,
+                                egui::Button::new(text(language, "download_model")).fill(PANEL),
+                            )
+                            .clicked()
+                    {
+                        download_model = true;
+                    }
+                    if !ready
+                        && ui
+                            .add_enabled(
+                                !self.ai_installing,
+                                egui::Button::new(
+                                    RichText::new(text(language, "download_all"))
+                                        .strong()
+                                        .color(INK),
+                                )
+                                .fill(SIGNAL),
+                            )
+                            .clicked()
+                    {
+                        download_all = true;
+                    }
+                });
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(text(language, "download_help"))
+                        .size(10.0)
+                        .color(MUTED),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.ai_installing,
+                            egui::Button::new(text(language, "use_downloaded_model")),
+                        )
+                        .clicked()
+                    {
+                        choose_model = true;
+                    }
+                    if ui.button(text(language, "copy_model_link")).clicked() {
+                        ctx.copy_text(MODEL_DOWNLOAD_URL.into());
+                        self.notice = Some((text(language, "link_copied").into(), false));
+                    }
+                    if ui.button(text(language, "open_model_page")).clicked() {
+                        let _ = opener::open(MODEL_PAGE_URL);
+                    }
+                    if ui.button(text(language, "copy_runtime_links")).clicked() {
+                        ctx.copy_text(format!(
+                            "{RUNTIME_CORE_URL}\n{RUNTIME_CUDA_1_URL}\n{RUNTIME_CUDA_2_URL}"
+                        ));
+                        self.notice = Some((text(language, "runtime_links_copied").into(), false));
+                    }
+                });
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(text(language, "close")).clicked() {
+                        close_requested = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                ready && !self.ai_installing,
+                                egui::Button::new(
+                                    RichText::new(text(language, "continue_index"))
+                                        .strong()
+                                        .color(INK),
+                                )
+                                .fill(SIGNAL),
+                            )
+                            .clicked()
+                        {
+                            continue_index = true;
+                        }
+                    });
+                });
+            });
+
+        self.ai_setup_open = open && !close_requested;
+        if download_runtime {
+            self.start_ai_install(true, ModelInstallSource::None);
+        } else if download_model {
+            self.start_ai_install(false, ModelInstallSource::Download);
+        } else if download_all {
+            self.start_ai_install(
+                !runtime_ready,
+                if model_ready {
+                    ModelInstallSource::None
+                } else {
+                    ModelInstallSource::Download
+                },
+            );
+        } else if choose_model {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title(text(language, "select_model"))
+                .add_filter("SafeTensors", &["safetensors"])
+                .pick_file()
+            {
+                self.start_ai_install(false, ModelInstallSource::Local(path));
+            }
+        }
+        if continue_index {
+            self.ai_setup_open = false;
+            let resume = self.resume_index_after_ai_setup;
+            self.resume_index_after_ai_setup = false;
+            if resume {
+                self.start_index();
+            }
+        } else if !self.ai_setup_open && !self.ai_installing {
+            self.resume_index_after_ai_setup = false;
+        }
+    }
+
     fn show_clear_index_confirmation(&mut self, ctx: &egui::Context) {
         if !self.clear_index_confirm {
             return;
         }
+        let language = self.preferences.language;
         let mut decision = None;
-        egui::Window::new("Clear current index?")
+        egui::Window::new(text(language, "clear_index_title"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -2502,26 +2983,28 @@ impl PastVideoApp {
             )
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("All indexed moments, search vectors, saved categories, and failed-item records for the current provider will be removed.")
+                    RichText::new(text(language, "clear_index_body"))
                         .size(12.0)
                         .color(CREAM),
                 );
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("Source videos are never deleted. You can index the library again afterward.")
+                    RichText::new(text(language, "clear_index_safe"))
                         .size(11.0)
                         .color(MUTED),
                 );
                 ui.add_space(18.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(text(language, "cancel")).clicked() {
                         decision = Some(false);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("Clear index").strong().color(CREAM),
+                                    RichText::new(text(language, "clear_index"))
+                                        .strong()
+                                        .color(CREAM),
                                 )
                                 .fill(Color32::from_rgb(120, 47, 35)),
                             )
@@ -2566,7 +3049,10 @@ impl PastVideoApp {
                     );
                     ui.label(RichText::new(message).size(11.0).color(CREAM));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Dismiss").clicked() {
+                        if ui
+                            .small_button(text(self.preferences.language, "dismiss"))
+                            .clicked()
+                        {
                             self.notice = None;
                         }
                     });
@@ -2612,9 +3098,12 @@ impl eframe::App for PastVideoApp {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label(
-                                    RichText::new(format!("{}…", task.label()))
-                                        .size(11.0)
-                                        .color(SIGNAL),
+                                    RichText::new(format!(
+                                        "{}…",
+                                        task.label(self.preferences.language)
+                                    ))
+                                    .size(11.0)
+                                    .color(SIGNAL),
                                 );
                             });
                         }
@@ -2629,6 +3118,7 @@ impl eframe::App for PastVideoApp {
             });
         self.show_settings(&ctx);
         self.show_clear_index_confirmation(&ctx);
+        self.show_ai_setup(&ctx);
         self.show_player_window(&ctx);
     }
 
@@ -2831,6 +3321,58 @@ fn empty_panel(ui: &mut egui::Ui, title: &str, detail: &str) {
         });
 }
 
+fn ai_status_row(ui: &mut egui::Ui, label: &str, status: &str, ready: bool) {
+    egui::Frame::new()
+        .fill(PANEL)
+        .stroke(Stroke::new(1.0, if ready { SIGNAL } else { LINE }))
+        .corner_radius(7)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).size(12.0).strong().color(CREAM));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(status).size(10.0).color(if ready {
+                        SIGNAL
+                    } else {
+                        MUTED
+                    }));
+                });
+            });
+        });
+    ui.add_space(7.0);
+}
+
+fn format_download_progress(completed: u64, total: Option<u64>) -> String {
+    let completed_gib = completed as f64 / 1024.0 / 1024.0 / 1024.0;
+    match total {
+        Some(total) => format!(
+            "{completed_gib:.2} / {:.2} GiB",
+            total as f64 / 1024.0 / 1024.0 / 1024.0
+        ),
+        None => format!("{completed_gib:.2} GiB"),
+    }
+}
+
+fn localized_download_stage(language: Language, stage: &str) -> String {
+    let prefix = if stage.starts_with("Downloading") {
+        text(language, "downloading")
+    } else if stage.starts_with("Verifying") {
+        text(language, "verifying")
+    } else if stage.starts_with("Extracting") {
+        text(language, "extracting")
+    } else if stage.starts_with("Copying") {
+        text(language, "copying")
+    } else {
+        return stage.to_owned();
+    };
+    let detail = stage.split_once(' ').map(|(_, value)| value).unwrap_or("");
+    if detail.is_empty() {
+        prefix.to_owned()
+    } else {
+        format!("{prefix} {detail}")
+    }
+}
+
 fn setting_text(ui: &mut egui::Ui, label: &str, value: &mut String, password: bool) {
     ui.label(RichText::new(label).monospace().size(9.0).color(MUTED));
     let mut edit = egui::TextEdit::singleline(value).desired_width(430.0);
@@ -2841,15 +3383,190 @@ fn setting_text(ui: &mut egui::Ui, label: &str, value: &mut String, password: bo
     ui.add_space(10.0);
 }
 
-fn setting_dimension(ui: &mut egui::Ui, value: &mut usize, range: std::ops::RangeInclusive<usize>) {
-    ui.label(
-        RichText::new("DIMENSIONS")
-            .monospace()
-            .size(9.0)
-            .color(MUTED),
-    );
+fn setting_dimension(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut usize,
+    range: std::ops::RangeInclusive<usize>,
+) {
+    ui.label(RichText::new(label).monospace().size(9.0).color(MUTED));
     ui.add(egui::DragValue::new(value).range(range).speed(8));
     ui.add_space(10.0);
+}
+
+fn provider_label(language: Language, provider: EmbeddingProvider) -> &'static str {
+    match provider {
+        EmbeddingProvider::Gemini => text(language, "gemini"),
+        EmbeddingProvider::Remote => text(language, "remote"),
+        EmbeddingProvider::LocalGpu => text(language, "local_gpu"),
+        EmbeddingProvider::LocalCpu => text(language, "local_cpu"),
+    }
+}
+
+fn category_label(language: Language, category: &str) -> &str {
+    match (language, category) {
+        (Language::SimplifiedChinese, "Entertainment") => "娱乐",
+        (Language::SimplifiedChinese, "People") => "人物",
+        (Language::SimplifiedChinese, "Places") => "地点",
+        (Language::SimplifiedChinese, "Nature") => "自然",
+        (Language::SimplifiedChinese, "Food") => "美食",
+        (Language::SimplifiedChinese, "Sports") => "运动",
+        (Language::SimplifiedChinese, "Animals") => "动物",
+        (Language::SimplifiedChinese, "Vehicles") => "车辆",
+        (Language::SimplifiedChinese, "Work") => "工作",
+        (Language::TraditionalChinese, "Entertainment") => "娛樂",
+        (Language::TraditionalChinese, "People") => "人物",
+        (Language::TraditionalChinese, "Places") => "地點",
+        (Language::TraditionalChinese, "Nature") => "自然",
+        (Language::TraditionalChinese, "Food") => "美食",
+        (Language::TraditionalChinese, "Sports") => "運動",
+        (Language::TraditionalChinese, "Animals") => "動物",
+        (Language::TraditionalChinese, "Vehicles") => "車輛",
+        (Language::TraditionalChinese, "Work") => "工作",
+        (Language::SimplifiedChinese, "Unsorted") => "未分类",
+        (Language::TraditionalChinese, "Unsorted") => "未分類",
+        _ => category,
+    }
+}
+
+fn folder_already_added(language: Language) -> String {
+    match language {
+        Language::English => "That folder is already in your library.",
+        Language::SimplifiedChinese => "该文件夹已在视频库中。",
+        Language::TraditionalChinese => "該資料夾已在影片庫中。",
+    }
+    .into()
+}
+
+fn add_folder_first(language: Language) -> String {
+    match language {
+        Language::English => "Add a folder first.",
+        Language::SimplifiedChinese => "请先添加文件夹。",
+        Language::TraditionalChinese => "請先新增資料夾。",
+    }
+    .into()
+}
+
+fn folder_removed_message(language: Language, folder: String, videos: usize) -> String {
+    match language {
+        Language::English => format!(
+            "Removed {folder} and {videos} videos from this library. Source files and saved index data were not changed."
+        ),
+        Language::SimplifiedChinese => format!(
+            "已从视频库移除 {folder} 及其 {videos} 个视频；源文件和已保存的索引数据未更改。"
+        ),
+        Language::TraditionalChinese => format!(
+            "已從影片庫移除 {folder} 及其 {videos} 部影片；來源檔案和已儲存的索引資料未變更。"
+        ),
+    }
+}
+
+fn scan_ready_message(language: Language, videos: usize, folders: usize) -> String {
+    match language {
+        Language::English => format!(
+            "Found {videos} videos across {folders} {}. Ready to index.",
+            if folders == 1 { "folder" } else { "folders" }
+        ),
+        Language::SimplifiedChinese => {
+            format!("已在 {folders} 个文件夹中找到 {videos} 个视频，可以开始索引。")
+        }
+        Language::TraditionalChinese => {
+            format!("已在 {folders} 個資料夾中找到 {videos} 部影片，可以開始索引。")
+        }
+    }
+}
+
+fn index_finished_message(
+    language: Language,
+    cancelled: bool,
+    new_moments: usize,
+    videos: usize,
+    total_moments: i64,
+) -> String {
+    match language {
+        Language::English if cancelled => format!(
+            "Indexing stopped. Kept {new_moments} new moments from {videos} videos · {total_moments} total moments"
+        ),
+        Language::English => format!(
+            "Indexed {new_moments} new moments from {videos} videos · {total_moments} total moments"
+        ),
+        Language::SimplifiedChinese if cancelled => format!(
+            "索引已停止。已保留 {videos} 个视频的 {new_moments} 个新片段 · 共 {total_moments} 个片段"
+        ),
+        Language::SimplifiedChinese => format!(
+            "已为 {videos} 个视频建立 {new_moments} 个新片段索引 · 共 {total_moments} 个片段"
+        ),
+        Language::TraditionalChinese if cancelled => format!(
+            "索引已停止。已保留 {videos} 部影片的 {new_moments} 個新片段 · 共 {total_moments} 個片段"
+        ),
+        Language::TraditionalChinese => format!(
+            "已為 {videos} 部影片建立 {new_moments} 個新片段索引 · 共 {total_moments} 個片段"
+        ),
+    }
+}
+
+fn index_cleared_message(language: Language, moments: i64, records: i64) -> String {
+    match language {
+        Language::English => format!(
+            "Cleared {moments} visual moments and {records} understanding records. Source videos were not changed."
+        ),
+        Language::SimplifiedChinese => format!(
+            "已清除 {moments} 个视觉片段和 {records} 条理解记录；源视频未更改。"
+        ),
+        Language::TraditionalChinese => format!(
+            "已清除 {moments} 個視覺片段和 {records} 筆理解記錄；來源影片未變更。"
+        ),
+    }
+}
+
+fn segment_saved_message(language: Language, name: &str) -> String {
+    match language {
+        Language::English => format!("Saved matched segment as {name}."),
+        Language::SimplifiedChinese => format!("匹配片段已保存为 {name}。"),
+        Language::TraditionalChinese => format!("相符片段已儲存為 {name}。"),
+    }
+}
+
+fn settings_saved_message(language: Language) -> String {
+    match language {
+        Language::English => "Embedding provider saved. Providers keep separate indexes.",
+        Language::SimplifiedChinese => "向量模型设置已保存；不同提供方使用独立索引。",
+        Language::TraditionalChinese => "向量模型設定已儲存；不同提供者使用獨立索引。",
+    }
+    .into()
+}
+
+fn provider_hover_text(language: Language, provider: &str) -> String {
+    match language {
+        Language::English => format!("Embedding provider: {provider}"),
+        Language::SimplifiedChinese => format!("向量模型提供方：{provider}"),
+        Language::TraditionalChinese => format!("向量模型提供者：{provider}"),
+    }
+}
+
+fn clear_index_help(language: Language, provider: &str) -> String {
+    match language {
+        Language::English => format!(
+            "Clear the {provider} index to rebuild it from scratch. Your video files stay untouched."
+        ),
+        Language::SimplifiedChinese => {
+            format!("清除 {provider} 索引后可从头重建；视频文件不会被修改。")
+        }
+        Language::TraditionalChinese => {
+            format!("清除 {provider} 索引後可從頭重建；影片檔案不會被修改。")
+        }
+    }
+}
+
+fn search_results_title(language: Language, query: Option<&str>) -> String {
+    match (language, query) {
+        (Language::English, Some(query)) => format!("Results for “{query}”"),
+        (Language::SimplifiedChinese, Some(query)) => format!("“{query}”的搜索结果"),
+        (Language::TraditionalChinese, Some(query)) => format!("「{query}」的搜尋結果"),
+        (Language::English, None) => "Results".into(),
+        (Language::SimplifiedChinese, None) => "搜索结果".into(),
+        (Language::TraditionalChinese, None) => "搜尋結果".into(),
+    }
 }
 
 fn same_match(left: &Match, right: &Match) -> bool {
@@ -3551,5 +4268,19 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), CATEGORY_DEFINITIONS.len());
+    }
+
+    #[test]
+    fn localized_desktop_statuses_do_not_fall_back_to_english() {
+        assert_eq!(
+            category_label(Language::SimplifiedChinese, "Unsorted"),
+            "未分类"
+        );
+        assert_eq!(
+            category_label(Language::TraditionalChinese, "Unsorted"),
+            "未分類"
+        );
+        assert!(scan_ready_message(Language::SimplifiedChinese, 10, 1).contains("可以开始索引"));
+        assert!(clear_index_help(Language::TraditionalChinese, "本機 GPU").contains("影片檔案"));
     }
 }

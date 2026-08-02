@@ -1,5 +1,6 @@
 //! User-facing embedding provider configuration and factory.
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -24,10 +25,10 @@ pub enum EmbeddingProvider {
 impl EmbeddingProvider {
     pub const ALL: [Self; 4] = [Self::LocalGpu, Self::LocalCpu, Self::Gemini, Self::Remote];
 
-    /// Prefer the private local CUDA backend when its runtime and model are
-    /// available, otherwise use the dependency-free local CPU backend.
+    /// Prefer the private local CUDA backend whenever an NVIDIA GPU is present.
+    /// The desktop setup flow installs a missing runtime or model on demand.
     pub fn automatic_local() -> Self {
-        if QwenConfig::from_env().is_ok() && cuda_gpu_available() {
+        if cuda_gpu_available() {
             Self::LocalGpu
         } else {
             Self::LocalCpu
@@ -62,6 +63,7 @@ pub struct EmbeddingSettings {
     pub remote_endpoint: String,
     pub remote_model: String,
     pub remote_dimensions: usize,
+    pub local_model_path: Option<PathBuf>,
     #[serde(skip)]
     pub gemini_api_key: String,
     #[serde(skip)]
@@ -77,6 +79,7 @@ impl Default for EmbeddingSettings {
             remote_endpoint: "http://127.0.0.1:8080/embed".into(),
             remote_model: "multimodal-embedding".into(),
             remote_dimensions: 768,
+            local_model_path: None,
             gemini_api_key: String::new(),
             remote_api_key: String::new(),
         }
@@ -160,7 +163,9 @@ pub fn create_embedder(settings: &EmbeddingSettings) -> Result<Box<dyn Embedder>
             dimensions: settings.remote_dimensions,
             timeout: Duration::from_secs(120),
         })?)),
-        EmbeddingProvider::LocalGpu => Ok(Box::new(QwenEmbedder::from_env()?)),
+        EmbeddingProvider::LocalGpu => Ok(Box::new(QwenEmbedder::new(QwenConfig::discover(
+            settings.local_model_path.as_deref(),
+        )?)?)),
         EmbeddingProvider::LocalCpu => Ok(Box::new(BaselineEmbedder::new())),
     }
 }

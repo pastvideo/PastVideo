@@ -69,6 +69,8 @@ remote deployments.
 - Full-video playback from a matched timestamp rather than a restricted clip.
 - GPU-backed matched-segment export on supported Windows systems, with safe CPU
   fallback.
+- Native UI localization with automatic system-language detection and a manual
+  switch between English, Simplified Chinese, and Traditional Chinese.
 - Local SQLite indexes isolated by embedding provider and model.
 - Immutable, timestamped analyzer artifacts with model/configuration provenance.
 - Multiple logical indexes and immutable physical versions projected from the
@@ -79,42 +81,54 @@ remote deployments.
 
 ## Quick start: Desktop (Windows)
 
-Requirements:
+For normal use, download `PastVideo-v0.2.0-win-x64.zip` from the latest GitHub
+Release, extract it, and double-click `PastVideo.exe`. The package includes
+FFmpeg and everything needed by the native interface. It does not require Rust,
+Python, a CUDA Toolkit, or a separate FFmpeg installation.
 
-- Rust with the stable toolchain
-- Windows PowerShell
-- FFmpeg on `PATH`, or a local build at `.tools\ffmpeg\bin`
-- An NVIDIA GPU with about 8 GB or more free VRAM for the Qwen backend
-  (optional; CPU mode is available)
-
-Set up the reusable local Qwen environment once:
-
-```powershell
-.\scripts\setup_qwen.ps1
-```
-
-Run the native app:
-
-```powershell
-.\scripts\run_desktop.ps1
-```
+PastVideo chooses the interface language from Windows on first launch. English,
+简体中文, and 繁體中文 can also be selected at any time under **Settings →
+Language**.
 
 In the app:
 
 1. Select **Add folder** and choose one or more video folders.
-2. Select **Index new videos**. The button becomes **Stop indexing** while work
-   is active.
-3. Search as soon as the first videos have finished indexing.
-4. Select a video or search result to play it, reveal it in Explorer, or save the
-   matched segment.
+2. Select **Index new videos**. On a machine with a supported NVIDIA GPU,
+   PastVideo opens **Prepare local AI** the first time and offers to download
+   the portable CUDA runtime and Qwen model. Downloads are resumable and their
+   SHA-256 checksums are verified before use.
+3. For an external download manager, copy the direct links from the same dialog.
+   After downloading `model.safetensors`, choose **Use downloaded model file**
+   and select it. No manual Python or CUDA configuration is needed.
+4. Continue indexing. Search is available as soon as the first video finishes;
+   unfinished videos are not included in results.
+
+The AI runtime is about 2.7 GiB compressed and the model is about 4.0 GiB. They
+are installed once under the current Windows user's local application-data
+folder and reused by later releases. On systems without a supported NVIDIA GPU,
+PastVideo selects the dependency-light local CPU backend.
+
+### Build from source
+
+Developers need Rust stable and Windows PowerShell. The reusable development
+environment can be created with:
+
+```powershell
+.\scripts\setup_qwen.ps1
+.\scripts\run_desktop.ps1
+```
 
 Build a portable Windows folder containing `PastVideo.exe` and FFmpeg tools:
 
 ```powershell
-.\scripts\package_windows.ps1
+.\scripts\package_windows.ps1 -CreateArchive
 ```
 
-The package is written to `.tools\release\PastVideo-win-x64`.
+The folder and ZIP are written under `.tools\release`. The reproducible portable
+AI runtime assets are built separately by
+`scripts\build_portable_runtime.ps1`; release maintainers can find the complete
+asset layout and verification procedure in
+[`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).
 
 ## Quick start: Server (headless)
 
@@ -296,7 +310,13 @@ search.
 
 ## Local model configuration
 
-The Windows setup script uses these defaults:
+Release builds install their self-contained local AI files under:
+
+- Runtime: `%LOCALAPPDATA%\PastVideo\ai\runtime`
+- Model: `%LOCALAPPDATA%\PastVideo\ai\models\Qwen3-VL-Embedding-2B`
+
+For source builds, the legacy setup script uses these defaults and remains
+compatible with the desktop and server binaries:
 
 - Python: `%USERPROFILE%\.venvs\qwen3-vl-cu128\Scripts\python.exe`
 - Model: `%USERPROFILE%\.cache\pastvideo\models\Qwen3-VL-Embedding-2B-modelscope`
@@ -356,7 +376,7 @@ cargo run --release -- --data-dir .tools\benchmark-data benchmark `
 
 ## Roadmap
 
-- Windows desktop packaging and performance hardening
+- Windows desktop performance hardening and code signing
 - macOS desktop support
 - Easier headless-server packaging and deployment
 - More local embedding models and remote-provider adapters
