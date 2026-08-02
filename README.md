@@ -60,8 +60,6 @@ remote deployments.
   intentionally excluded.
 - Automatic categories that update as each video finishes indexing.
 - Natural-language and image-to-video semantic search.
-- Optional local scene descriptions, screen-text OCR, and Whisper speech
-  transcripts, fused with the visual index and shown as timestamped evidence.
 - Search remains available during partial indexing and only considers completed
   indexed videos.
 - Virtualized video grids and lazy thumbnail decoding for large libraries.
@@ -106,12 +104,8 @@ In the app:
 1. Select **Add folder** and choose one or more video folders.
 2. Select **Index new videos**. The button becomes **Stop indexing** while work
    is active.
-3. Select **Understand content** to add local Caption, OCR, and Whisper evidence.
-   Progress is committed after every video and the button becomes **Stop
-   understanding** while active.
-4. Search as soon as the first videos have finished indexing; understanding can
-   continue in the background.
-5. Select a video or search result to play it, reveal it in Explorer, or save the
+3. Search as soon as the first videos have finished indexing.
+4. Select a video or search result to play it, reveal it in Explorer, or save the
    matched segment.
 
 Build a portable Windows folder containing `PastVideo.exe` and FFmpeg tools:
@@ -160,7 +154,7 @@ To run the optional browser client and local API together:
 ## Command-line usage
 
 ```powershell
-# Create visual, Caption, OCR, Whisper, and fused text indexes locally
+# Experimental CLI-only Caption, OCR, Whisper, and fused-text pipeline
 .\target\release\pastvideo.exe --data-dir .tools\my-index --backend qwen enhance "D:\Videos"
 
 # Search indexed footage
@@ -176,8 +170,9 @@ To run the optional browser client and local API together:
 
 Run `pastvideo --help` or `pastvideo <command> --help` for the complete CLI.
 
-The local Caption/OCR/Whisper implementation, measured throughput, real-folder
-quality checks, failure recovery, and native UI validation are documented in
+Caption/OCR/Whisper remain experimental CLI/server capabilities and are not
+exposed by PastVideo Desktop or used by desktop search. Their measured
+throughput, real-folder quality checks, and failure recovery are documented in
 [`docs/MULTIMODAL_UNDERSTANDING_E2E_REPORT.md`](docs/MULTIMODAL_UNDERSTANDING_E2E_REPORT.md).
 
 ## Durable Understanding → Artifact → Index workflow
